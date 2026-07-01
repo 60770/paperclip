@@ -194,7 +194,7 @@ describe("issue execution policy routes", () => {
       issue: {
         id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
         companyId: "company-1",
-        identifier: "PAP-1002",
+        identifier: "issue-1002",
         title: "Child issue",
       },
       parentBlockerAdded: false,
@@ -229,7 +229,7 @@ describe("issue execution policy routes", () => {
       assigneeAgentId: "33333333-3333-4333-8333-333333333333",
       assigneeUserId: null,
       createdByUserId: "local-board",
-      identifier: "PAP-1003",
+      identifier: "issue-1003",
       title: "Missing review path",
       executionPolicy: null,
       executionState: null,
@@ -263,7 +263,7 @@ describe("issue execution policy routes", () => {
       assigneeAgentId: "33333333-3333-4333-8333-333333333333",
       assigneeUserId: null,
       createdByUserId: "local-board",
-      identifier: "PAP-1004",
+      identifier: "issue-1004",
       title: "Pending confirmation",
       executionPolicy: null,
       executionState: null,
@@ -302,7 +302,7 @@ describe("issue execution policy routes", () => {
       assigneeAgentId: "33333333-3333-4333-8333-333333333333",
       assigneeUserId: null,
       createdByUserId: "local-board",
-      identifier: "PAP-1005",
+      identifier: "issue-1005",
       title: "Execution participant",
       executionPolicy: null,
       executionState: null,
@@ -356,7 +356,7 @@ describe("issue execution policy routes", () => {
       assigneeAgentId: "33333333-3333-4333-8333-333333333333",
       assigneeUserId: null,
       createdByUserId: "local-board",
-      identifier: "PAP-1006",
+      identifier: "issue-1006",
       title: "External review monitor",
       executionPolicy: null,
       executionState: null,
@@ -409,7 +409,7 @@ describe("issue execution policy routes", () => {
       assigneeAgentId: "33333333-3333-4333-8333-333333333333",
       assigneeUserId: null,
       createdByUserId: "local-board",
-      identifier: "PAP-1007",
+      identifier: "issue-1007",
       title: "Board repair",
       executionPolicy: null,
       executionState: null,
@@ -447,7 +447,7 @@ describe("issue execution policy routes", () => {
       assigneeAgentId: null,
       assigneeUserId: "local-board",
       createdByUserId: "local-board",
-      identifier: "PAP-999",
+      identifier: "issue-999",
       title: "Execution policy edit",
       executionPolicy: null,
       executionState: null,
@@ -488,7 +488,7 @@ describe("issue execution policy routes", () => {
       assigneeAgentId: "33333333-3333-4333-8333-333333333333",
       assigneeUserId: null,
       createdByUserId: "local-board",
-      identifier: "PAP-1001",
+      identifier: "issue-1001",
       title: "Manual monitor trigger",
       executionPolicy: normalizeIssueExecutionPolicy({
         monitor: {
@@ -525,7 +525,7 @@ describe("issue execution policy routes", () => {
       assigneeAgentId: "11111111-1111-4111-8111-111111111111",
       assigneeUserId: null,
       createdByUserId: "local-board",
-      identifier: "PAP-1001",
+      identifier: "issue-1001",
       title: "Parent issue",
       executionPolicy: null,
       executionState: null,
@@ -570,7 +570,7 @@ describe("issue execution policy routes", () => {
       assigneeAgentId: "11111111-1111-4111-8111-111111111111",
       assigneeUserId: null,
       createdByUserId: "local-board",
-      identifier: "PAP-1001",
+      identifier: "issue-1001",
       title: "Parent issue",
       executionPolicy: null,
       executionState: null,
@@ -609,7 +609,7 @@ describe("issue execution policy routes", () => {
       assigneeAgentId: "33333333-3333-4333-8333-333333333333",
       assigneeUserId: null,
       createdByUserId: "local-board",
-      identifier: "PAP-1001",
+      identifier: "issue-1001",
       title: "Parent issue",
       executionPolicy: null,
       executionState: null,
@@ -649,5 +649,367 @@ describe("issue execution policy routes", () => {
         details: expect.not.objectContaining({ externalRef: expect.anything() }),
       }),
     );
+  });
+
+  it("rejects a PATCH that drops the active stage together with status:done", async () => {
+    const actorAgentId = "33333333-3333-4333-8333-333333333333";
+    const devAgentId = "44444444-4444-4444-8444-444444444444";
+    const reviewStageId = "55555555-5555-4555-8555-555555555555";
+    const approvalStageId = "66666666-6666-4666-8666-666666666666";
+    const issue = {
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      companyId: "company-1",
+      status: "in_review",
+      assigneeAgentId: actorAgentId,
+      assigneeUserId: null,
+      createdByUserId: "local-board",
+      identifier: "issue-1010",
+      title: "Gate bypass attempt",
+      executionPolicy: {
+        stages: [
+          { id: reviewStageId, type: "review", participants: [{ type: "agent", agentId: actorAgentId }] },
+          { id: approvalStageId, type: "approval", participants: [{ type: "user", userId: "cto-user" }] },
+        ],
+      },
+      executionState: {
+        status: "pending",
+        currentStageId: reviewStageId,
+        currentStageIndex: 0,
+        currentStageType: "review",
+        currentParticipant: { type: "agent", agentId: actorAgentId },
+        returnAssignee: { type: "agent", agentId: devAgentId },
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+      },
+    };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...issue,
+      ...patch,
+      updatedAt: new Date(),
+    }));
+
+    const res = await request(await createApp({
+      type: "agent",
+      agentId: actorAgentId,
+      companyId: "company-1",
+      runId: "run-1",
+    }))
+      .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+      .send({
+        status: "done",
+        comment: "approving my own work",
+        // Attacker drops the active review stage and makes themselves the sole
+        // approver, in the same request that asks for terminal `done`.
+        executionPolicy: {
+          stages: [
+            { id: approvalStageId, type: "approval", participants: [{ type: "agent", agentId: actorAgentId }] },
+          ],
+        },
+      });
+
+    // The attacker is the untrusted active reviewer, so the route trust
+    // gate now blocks this same-PATCH ladder rewrite (403) before it ever reaches
+    // the engine's ladder guard (422). The attack is still fully blocked
+    // — `update` is never called. The engine 422 backstop is exercised on its own
+    // via a trusted actor below, and directly in issue-execution-policy.test.ts.
+    expect(res.status).toBe(403);
+    expect(JSON.stringify(res.body)).toContain("execution_policy:manage");
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
+  describe("two-step clear-then-done trust gate", () => {
+    const devAgentId = "44444444-4444-4444-8444-444444444444";
+    const reviewStageId = "55555555-5555-4555-8555-555555555555";
+    const approvalStageId = "66666666-6666-4666-8666-666666666666";
+    const trustedAgentId = "77777777-7777-4777-8777-777777777777";
+    const ISSUE_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+
+    function attachedPolicy() {
+      return {
+        stages: [
+          { id: reviewStageId, type: "review", participants: [{ type: "agent", agentId: trustedAgentId }] },
+          { id: approvalStageId, type: "approval", participants: [{ type: "user", userId: "cto-user" }] },
+        ],
+      };
+    }
+
+    function activeChangesRequestedIssue() {
+      // Engine rebounded the issue to the Dev (returnAssignee): in_progress,
+      // assigned to the Dev, stage still active (changes_requested). The Dev is
+      // the work-actor the done-gate must constrain.
+      return {
+        id: ISSUE_ID,
+        companyId: "company-1",
+        status: "in_progress",
+        assigneeAgentId: devAgentId,
+        assigneeUserId: null,
+        createdByUserId: "local-board",
+        identifier: "issue-1011",
+        title: "Two-step clear attempt",
+        executionPolicy: attachedPolicy(),
+        executionState: {
+          status: "changes_requested",
+          currentStageId: reviewStageId,
+          currentStageIndex: 0,
+          currentStageType: "review",
+          currentParticipant: { type: "agent", agentId: trustedAgentId },
+          returnAssignee: { type: "agent", agentId: devAgentId },
+          completedStageIds: [],
+          lastDecisionId: null,
+          lastDecisionOutcome: "changes_requested",
+        },
+      };
+    }
+
+    it("blocks step 1 of the two-step bypass: the Dev clearing their own active gate is 403", async () => {
+      const issue = activeChangesRequestedIssue();
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+        ...issue,
+        ...patch,
+        updatedAt: new Date(),
+      }));
+
+      const res = await request(await createApp({
+        type: "agent",
+        agentId: devAgentId,
+        companyId: "company-1",
+        runId: "run-1",
+      }))
+        .patch(`/api/issues/${ISSUE_ID}`)
+        // The bare clear that today slips past the same-PATCH fail-closed
+        // (no status:done in this request) and would leave the issue legacy so a
+        // follow-up { status: done } lands ungated.
+        .send({ executionPolicy: null });
+
+      expect(res.status).toBe(403);
+      expect(JSON.stringify(res.body)).toContain("execution_policy:manage");
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
+    it("blocks the pre-activation twin: Dev clears an attached policy before the workflow starts (403)", async () => {
+      // Policy attached at creation, but the issue is still in_progress and the
+      // workflow has not started (executionState: null). The same clear-then-done
+      // bypass applies; the gate must fire even though no stage is active.
+      const issue = {
+        id: ISSUE_ID,
+        companyId: "company-1",
+        status: "in_progress",
+        assigneeAgentId: devAgentId,
+        assigneeUserId: null,
+        createdByUserId: "local-board",
+        identifier: "issue-1012",
+        title: "Pre-activation clear attempt",
+        executionPolicy: attachedPolicy(),
+        executionState: null,
+      };
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+        ...issue,
+        ...patch,
+        updatedAt: new Date(),
+      }));
+
+      const res = await request(await createApp({
+        type: "agent",
+        agentId: devAgentId,
+        companyId: "company-1",
+        runId: "run-1",
+      }))
+        .patch(`/api/issues/${ISSUE_ID}`)
+        .send({ executionPolicy: null });
+
+      expect(res.status).toBe(403);
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
+    it("preserves the waive path: a board user may clear an attached active policy", async () => {
+      const issue = activeChangesRequestedIssue();
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+        ...issue,
+        ...patch,
+        updatedAt: new Date(),
+      }));
+
+      // Default actor is a local board user.
+      const res = await request(await createApp())
+        .patch(`/api/issues/${ISSUE_ID}`)
+        .send({ executionPolicy: null });
+
+      expect(res.status).toBe(200);
+      expect(JSON.stringify(res.body)).not.toContain("execution_policy:manage");
+      expect(mockIssueService.update).toHaveBeenCalled();
+    });
+
+    it("preserves the waive path: the assignee recovery agent holding execution_policy:manage may clear its active policy", async () => {
+      // Faithful to the production ReleaseBot recovery path: the trusted agent is
+      // the issue ASSIGNEE (final approval stage), so it clears the assignment
+      // write-boundary (assertAgentIssueMutationAllowed) as the assignee AND the
+      // trust gate via its execution_policy:manage grant. A non-assignee
+      // trusted agent is already blocked upstream by the assignment boundary
+      // is already blocked by the assignment boundary, independent of this gate.
+      mockAccessService.hasPermission.mockResolvedValue(true);
+      const issue = {
+        id: ISSUE_ID,
+        companyId: "company-1",
+        status: "in_review",
+        assigneeAgentId: trustedAgentId,
+        assigneeUserId: null,
+        createdByUserId: "local-board",
+        identifier: "issue-1014",
+        title: "Recovery clear by the assignee agent",
+        executionPolicy: attachedPolicy(),
+        executionState: {
+          status: "pending",
+          currentStageId: approvalStageId,
+          currentStageIndex: 1,
+          currentStageType: "approval",
+          currentParticipant: { type: "agent", agentId: trustedAgentId },
+          returnAssignee: { type: "agent", agentId: devAgentId },
+          completedStageIds: [reviewStageId],
+          lastDecisionId: null,
+          lastDecisionOutcome: null,
+        },
+      };
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+        ...issue,
+        ...patch,
+        updatedAt: new Date(),
+      }));
+
+      const res = await request(await createApp({
+        type: "agent",
+        agentId: trustedAgentId,
+        companyId: "company-1",
+        runId: "run-1",
+      }))
+        .patch(`/api/issues/${ISSUE_ID}`)
+        .send({ executionPolicy: null });
+
+      expect(res.status).toBe(200);
+      expect(mockIssueService.update).toHaveBeenCalled();
+    });
+
+    it("does not fire on an identical-ladder PATCH (no false positive)", async () => {
+      // Re-submitting the same stage ladder is not a clear or a change, so the
+      // gate must not fire even for the assignee Dev (e.g. a monitor-only
+      // reschedule keeps the ladder signature identical).
+      const issue = activeChangesRequestedIssue();
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+        ...issue,
+        ...patch,
+        updatedAt: new Date(),
+      }));
+
+      const res = await request(await createApp({
+        type: "agent",
+        agentId: devAgentId,
+        companyId: "company-1",
+        runId: "run-1",
+      }))
+        .patch(`/api/issues/${ISSUE_ID}`)
+        .send({ executionPolicy: attachedPolicy() });
+
+      expect(res.status).not.toBe(403);
+      expect(JSON.stringify(res.body)).not.toContain("execution_policy:manage");
+    });
+
+    it("closes the sibling executionState twin: clearing the active state via the body cannot land terminal done", async () => {
+      // The sibling vector to clearing executionPolicy is neutralizing the active
+      // executionState directly (keep the policy, drop the state) then landing
+      // `done`. `executionState` is NOT a writable field in the update schema, so
+      // it is stripped from the body — the gate state cannot be cleared via the
+      // PATCH at all. The leftover { status: done } on a changes_requested,
+      // policy-backed issue is then re-gated by the engine (premature-done
+      // redirect): the issue goes back to in_review with the review stage
+      // re-activated, NOT to terminal done.
+      const issue = activeChangesRequestedIssue();
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+        ...issue,
+        ...patch,
+        updatedAt: new Date(),
+      }));
+
+      const res = await request(await createApp({
+        type: "agent",
+        agentId: devAgentId,
+        companyId: "company-1",
+        runId: "run-1",
+      }))
+        .patch(`/api/issues/${ISSUE_ID}`)
+        .send({ executionState: null, status: "done" });
+
+      expect(res.status).toBe(200);
+      expect(mockIssueService.update).toHaveBeenCalled();
+      const patch = mockIssueService.update.mock.calls[0]?.[1] as Record<string, unknown>;
+      // Terminal `done` is never reached; the done-gate is re-established.
+      expect(patch.status).not.toBe("done");
+      expect(patch.status).toBe("in_review");
+      expect(patch.executionState).toBeTruthy();
+      expect((patch.executionState as { status?: string }).status).toBe("pending");
+    });
+
+    it("engine 422 backstop still fires for a trusted actor rewriting an active ladder + status:done", async () => {
+      // A trusted actor passes the route trust gate, so the same-PATCH
+      // engine guard must still independently refuse rewriting an active ladder
+      // together with status:done (defense in depth — the trust gate and the
+      // engine guard are layered, not redundant).
+      mockAccessService.hasPermission.mockResolvedValue(true);
+      const issue = {
+        id: ISSUE_ID,
+        companyId: "company-1",
+        status: "in_review",
+        assigneeAgentId: trustedAgentId,
+        assigneeUserId: null,
+        createdByUserId: "local-board",
+        identifier: "issue-1013",
+        title: "Trusted rewrite attempt",
+        executionPolicy: attachedPolicy(),
+        executionState: {
+          status: "pending",
+          currentStageId: reviewStageId,
+          currentStageIndex: 0,
+          currentStageType: "review",
+          currentParticipant: { type: "agent", agentId: trustedAgentId },
+          returnAssignee: { type: "agent", agentId: devAgentId },
+          completedStageIds: [],
+          lastDecisionId: null,
+          lastDecisionOutcome: null,
+        },
+      };
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+        ...issue,
+        ...patch,
+        updatedAt: new Date(),
+      }));
+
+      const res = await request(await createApp({
+        type: "agent",
+        agentId: trustedAgentId,
+        companyId: "company-1",
+        runId: "run-1",
+      }))
+        .patch(`/api/issues/${ISSUE_ID}`)
+        .send({
+          status: "done",
+          comment: "rewrite and self-approve",
+          executionPolicy: {
+            stages: [
+              { id: approvalStageId, type: "approval", participants: [{ type: "agent", agentId: trustedAgentId }] },
+            ],
+          },
+        });
+
+      expect(res.status).toBe(422);
+      expect(JSON.stringify(res.body)).toContain("Cannot modify execution policy stages while a review or approval stage is active");
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
   });
 });
