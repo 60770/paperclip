@@ -373,6 +373,19 @@ export function normalizeIssueExecutionPolicy(input: unknown): IssueExecutionPol
     })
     .filter((stage): stage is NonNullable<typeof stage> => stage !== null);
 
+  // Stage ids must be unique. Unlike
+  // participants, caller-supplied stage ids are not deduped above, and the engine
+  // tracks stage completion by id in a Set (completedStageIds) — duplicate ids
+  // would collapse, letting completion of one stage mark a same-id sibling
+  // complete and silently shrink the gate. Reject duplicates at the boundary.
+  const seenStageIds = new Set<string>();
+  for (const stage of stages) {
+    if (seenStageIds.has(stage.id)) {
+      throw unprocessable("Execution policy stages must have unique ids");
+    }
+    seenStageIds.add(stage.id);
+  }
+
   const monitor = parsed.data.monitor
     ? {
       nextCheckAt: parsed.data.monitor.nextCheckAt,
@@ -439,6 +452,30 @@ function findStageById(policy: IssueExecutionPolicy, stageId: string | null | un
 function nextPendingStage(policy: IssueExecutionPolicy, state: IssueExecutionState | null) {
   const completed = new Set(state?.completedStageIds ?? []);
   return policy.stages.find((stage) => !completed.has(stage.id)) ?? null;
+}
+
+function stageLadderSignature(policy: IssueExecutionPolicy | null): string {
+  if (!policy) return "[]";
+  return JSON.stringify(
+    policy.stages.map((stage) => ({
+      id: stage.id,
+      type: stage.type,
+      approvalsNeeded: stage.approvalsNeeded ?? 1,
+      // Participants are compared in order: reordering changes which participant
+      // selectStageParticipant() picks by default, so it is a meaningful change
+      // to the gate and must not be treated as a no-op.
+      participants: stage.participants.map((participant) =>
+        participant.type === "agent" ? `agent:${participant.agentId}` : `user:${participant.userId}`,
+      ),
+    })),
+  );
+}
+
+export function executionStageLadderChanged(
+  previous: IssueExecutionPolicy | null,
+  next: IssueExecutionPolicy | null,
+): boolean {
+  return stageLadderSignature(previous) !== stageLadderSignature(next);
 }
 
 function selectStageParticipant(
@@ -591,9 +628,25 @@ function clearExecutionStatePatch(input: {
   returnAssignee: IssueExecutionStagePrincipal | null;
 }) {
   input.patch.executionState = null;
-  if (input.requestedStatus === undefined && input.issueStatus === "in_review" && input.returnAssignee) {
+  // Fail closed: clearing an active execution stage must never be a path to a
+  // terminal `done`. When the stage referenced by
+  // the current state is gone, route the issue back to its return assignee
+  // in_progress (same as the executionPolicy:null branch). When that is not
+  // possible, still strip a requested `done` down to in_review so the issue
+  // re-gates on the next workflow start, rather than reaching terminal `done`
+  // ungated. This is defense-in-depth behind the stage-ladder guard above, for
+  // residual cases (e.g. a persisted state whose stage vanished without a policy
+  // change, or a stage that has no eligible participant left).
+  const requestedDone = input.requestedStatus === "done";
+  if (
+    (input.requestedStatus === undefined || requestedDone) &&
+    input.issueStatus === "in_review" &&
+    input.returnAssignee
+  ) {
     input.patch.status = "in_progress";
     Object.assign(input.patch, patchForPrincipal(input.returnAssignee));
+  } else if (requestedDone) {
+    input.patch.status = "in_review";
   }
 }
 
@@ -626,6 +679,21 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
 
   if (!input.policy) {
     if (existingState) {
+      // Fail closed: clearing the policy entirely is the extreme case of a
+      // stage-ladder change (every stage removed), and must not be a path to
+      // terminal `done` while a stage is active.
+      // Reject the request rather than silently removing the gate — otherwise a
+      // single { executionPolicy: null, status: "done" } would both strip the
+      // gate and land `done`, and even a fail-closed status downgrade would still
+      // persist the gate removal, leaving `done` reachable by a follow-up PATCH.
+      // A legitimate waive clears the policy with no status change (or in_review),
+      // which is handled below untouched.
+      if (
+        (existingState.status === PENDING_STATUS || existingState.status === CHANGES_REQUESTED_STATUS) &&
+        requestedStatus === "done"
+      ) {
+        throw unprocessable("Cannot modify execution policy stages while a review or approval stage is active");
+      }
       patch.executionState = null;
       if (input.issue.status === "in_review" && existingState.returnAssignee) {
         patch.status = "in_progress";
@@ -643,6 +711,27 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
   ) {
     patch.executionState = null;
     return { patch };
+  }
+
+  // Gate-bypass hardening. The policy's stage
+  // ladder IS the done-gate. While a workflow stage is active, an actor able to
+  // PATCH the issue (assignees may mutate an in_review issue) must not be allowed
+  // to rewrite the stage ladder in the same request — otherwise they could either
+  // (a) drop the active stage so the clear path lets status:"done" survive, or
+  // (b) keep the active stage id but rewrite the downstream approval stage to make
+  // themselves its sole participant and self-approve to terminal `done`. Both reach
+  // `done` without completing the real gate. Refuse any change to the stage ladder
+  // while a stage is active. Clearing the policy entirely (executionPolicy:null) is
+  // handled above and stays allowed; monitor-only reschedules keep the ladder
+  // identical and pass. previousPolicy is supplied only by the PATCH route — the
+  // sole actor-controlled policy entry point — so a caller that passes no
+  // previousPolicy is not editing the ladder and is left untouched.
+  if (
+    input.previousPolicy !== undefined &&
+    (existingState?.status === PENDING_STATUS || existingState?.status === CHANGES_REQUESTED_STATUS) &&
+    executionStageLadderChanged(input.previousPolicy, input.policy)
+  ) {
+    throw unprocessable("Cannot modify execution policy stages while a review or approval stage is active");
   }
 
   if (existingState?.currentStageId && !currentStage) {

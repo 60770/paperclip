@@ -167,6 +167,7 @@ import {
 } from "../services/company-search-rate-limit.js";
 import {
   applyIssueExecutionPolicyTransition,
+  executionStageLadderChanged,
   normalizeIssueExecutionPolicy,
   parseIssueExecutionState,
   redactIssueMonitorExternalRef,
@@ -1653,6 +1654,42 @@ async function assertCanManageIssueMonitor(
   }
   if (req.actor.type === "agent" && req.actor.agentId && req.actor.agentId === assigneeAgentId) return;
   throw forbidden("Only the assignee agent or a board user can manage issue monitors");
+}
+
+// Done-gate authorization. The execution-policy stage ladder
+// IS the done-gate: removing or rewriting it removes the gate. While a ladder is
+// attached, only a *trusted* actor may modify or clear it — a board user, or an
+// agent holding the `execution_policy:manage` grant (e.g. a release/recovery
+// agent that legitimately waives a spike's gate or repairs a malformed policy).
+//
+// Unlike `assertCanManageIssueMonitor` this helper has NO assignee escape hatch:
+// in every bypass variant the malicious actor IS the current assignee (a Dev on
+// a `changes_requested` issue, a reviewer on the active stage). Letting the
+// assignee through would reopen the exact hole this closes. The gate fires on
+// any *ladder change or clear* of an already-attached policy, independent of
+// `executionState`, so it also covers the pre-activation case (policy attached,
+// workflow not yet started). Monitor-only reschedules keep the ladder signature
+// identical, so they do not trip this gate and stay governed by the monitor gate
+// above. Attaching a brand-new ladder where none existed only ADDS gating and is
+// not a bypass, so it is intentionally left to the monitor/transition path.
+async function assertCanManageExecutionPolicy(
+  accessSvc: ReturnType<typeof accessService>,
+  req: Request,
+  companyId: string,
+  ladderClearedOrChanged: boolean,
+) {
+  if (!ladderClearedOrChanged) return;
+  if (req.actor.type === "board") return;
+  const decision = await accessSvc.decide({
+    actor: req.actor,
+    action: "execution_policy:manage",
+    resource: { type: "company", companyId },
+  });
+  if (!decision.allowed) {
+    throw forbidden(
+      "Only a board user or an agent with execution_policy:manage may modify or clear an attached execution-policy stage ladder",
+    );
+  }
 }
 
 function summarizeIssueMonitor(
@@ -4513,7 +4550,7 @@ export function issueRoutes(
     };
   }
 
-  // Resolve issue identifiers (e.g. "PAP-39") to UUIDs for all /issues/:id routes
+  // Resolve issue identifiers to UUIDs for all /issues/:id routes
   router.param("id", async (req, res, next, rawId) => {
     try {
       req.params.id = await resolveIssueRouteId(rawId);
@@ -4523,7 +4560,7 @@ export function issueRoutes(
     }
   });
 
-  // Resolve issue identifiers (e.g. "PAP-39") to UUIDs for company-scoped attachment routes.
+  // Resolve issue identifiers to UUIDs for company-scoped attachment routes.
   router.param("issueId", async (req, res, next, rawId) => {
     try {
       req.params.issueId = await resolveIssueRouteId(rawId);
@@ -7733,6 +7770,23 @@ export function issueRoutes(
       existing.companyId,
       existing.assigneeAgentId,
       req.body.executionPolicy !== undefined && monitorChanged,
+    );
+    // Done-gate authorization. Clearing or rewriting an attached
+    // execution-policy stage ladder removes/weakens the done-gate, so it requires
+    // a trusted actor. Fires whenever an existing ladder is changed or cleared,
+    // regardless of executionState — this closes the two-step `clear-then-done`
+    // bypass (PATCH {executionPolicy:null} then PATCH {status:done}) and its
+    // pre-activation twin (policy attached, workflow not yet started). Monitor-only
+    // reschedules keep the ladder signature identical and do not trip it.
+    const executionPolicyLadderClearedOrChanged =
+      req.body.executionPolicy !== undefined &&
+      (previousExecutionPolicy?.stages?.length ?? 0) > 0 &&
+      executionStageLadderChanged(previousExecutionPolicy, nextExecutionPolicy);
+    await assertCanManageExecutionPolicy(
+      access,
+      req,
+      existing.companyId,
+      executionPolicyLadderClearedOrChanged,
     );
 
     const transition = applyIssueExecutionPolicyTransition({

@@ -1446,4 +1446,300 @@ describe("issue execution policy transitions", () => {
       ).toThrow("Monitor bounds are already exhausted");
     });
   });
+
+  describe("gate-bypass hardening for active execution stages", () => {
+    function pendingReviewIssue(policy: IssueExecutionPolicy) {
+      return {
+        status: "in_review",
+        assigneeAgentId: qaAgentId,
+        assigneeUserId: null,
+        executionPolicy: policy,
+        executionState: {
+          status: "pending" as const,
+          currentStageId: policy.stages[0].id,
+          currentStageIndex: 0,
+          currentStageType: "review" as const,
+          currentParticipant: { type: "agent" as const, agentId: qaAgentId },
+          returnAssignee: { type: "agent" as const, agentId: coderAgentId },
+          completedStageIds: [],
+          lastDecisionId: null,
+          lastDecisionOutcome: null,
+        },
+      };
+    }
+
+    it("rejects dropping the active stage together with status:done (vector 1)", () => {
+      const previousPolicy = twoStagePolicy();
+      // Attacker (the active reviewer) submits a policy that omits the active
+      // review stage and makes themselves the sole approver, plus status:done.
+      const tampered = makePolicy([
+        { type: "approval", participants: [{ type: "agent", agentId: qaAgentId }] },
+      ]);
+      expect(() =>
+        applyIssueExecutionPolicyTransition({
+          issue: pendingReviewIssue(previousPolicy),
+          policy: tampered,
+          previousPolicy,
+          requestedStatus: "done",
+          requestedAssigneePatch: {},
+          actor: { agentId: qaAgentId },
+          commentBody: "lgtm",
+        }),
+      ).toThrow("Cannot modify execution policy stages while a review or approval stage is active");
+    });
+
+    it("rejects keeping the active stage id but rewriting the downstream approval to self (vector 2)", () => {
+      const previousPolicy = twoStagePolicy();
+      const reviewStageId = previousPolicy.stages[0].id;
+      const approvalStageId = previousPolicy.stages[1].id;
+      // Active review stage id preserved; the downstream approval participant is
+      // swapped from the CTO to the attacker so they could self-approve to done.
+      const tampered = normalizeIssueExecutionPolicy({
+        stages: [
+          { id: reviewStageId, type: "review", participants: [{ type: "agent", agentId: qaAgentId }] },
+          { id: approvalStageId, type: "approval", participants: [{ type: "agent", agentId: qaAgentId }] },
+        ],
+      })!;
+      expect(() =>
+        applyIssueExecutionPolicyTransition({
+          issue: pendingReviewIssue(previousPolicy),
+          policy: tampered,
+          previousPolicy,
+          requestedStatus: "done",
+          requestedAssigneePatch: {},
+          actor: { agentId: qaAgentId },
+          commentBody: "approved by me",
+        }),
+      ).toThrow("Cannot modify execution policy stages while a review or approval stage is active");
+    });
+
+    it("rejects a changed ladder during changes_requested too", () => {
+      const previousPolicy = twoStagePolicy();
+      const reviewStageId = previousPolicy.stages[0].id;
+      const tampered = makePolicy([
+        { type: "approval", participants: [{ type: "agent", agentId: coderAgentId }] },
+      ]);
+      expect(() =>
+        applyIssueExecutionPolicyTransition({
+          issue: {
+            status: "in_progress",
+            assigneeAgentId: coderAgentId,
+            assigneeUserId: null,
+            executionPolicy: previousPolicy,
+            executionState: {
+              status: "changes_requested",
+              currentStageId: reviewStageId,
+              currentStageIndex: 0,
+              currentStageType: "review",
+              currentParticipant: { type: "agent", agentId: qaAgentId },
+              returnAssignee: { type: "agent", agentId: coderAgentId },
+              completedStageIds: [],
+              lastDecisionId: null,
+              lastDecisionOutcome: "changes_requested",
+            },
+          },
+          policy: tampered,
+          previousPolicy,
+          requestedStatus: "done",
+          requestedAssigneePatch: {},
+          actor: { agentId: coderAgentId },
+          commentBody: "done",
+        }),
+      ).toThrow("Cannot modify execution policy stages while a review or approval stage is active");
+    });
+
+    it("does not let status:done survive when the active stage vanished without a policy change (defense-in-depth)", () => {
+      // previousPolicy is omitted (the engine-internal / non-PATCH callers), so the
+      // ladder guard does not fire; the persisted state references a stage that is
+      // no longer present in the policy. clearExecutionStatePatch must fail closed.
+      const policy = twoStagePolicy();
+      const result = applyIssueExecutionPolicyTransition({
+        issue: {
+          status: "in_review",
+          assigneeAgentId: qaAgentId,
+          assigneeUserId: null,
+          executionPolicy: policy,
+          executionState: {
+            status: "pending",
+            currentStageId: "00000000-0000-4000-8000-00000000dead",
+            currentStageIndex: 0,
+            currentStageType: "review",
+            currentParticipant: { type: "agent", agentId: qaAgentId },
+            returnAssignee: { type: "agent", agentId: coderAgentId },
+            completedStageIds: [],
+            lastDecisionId: null,
+            lastDecisionOutcome: null,
+          },
+        },
+        policy,
+        requestedStatus: "done",
+        requestedAssigneePatch: {},
+        actor: { agentId: qaAgentId },
+        commentBody: "ship",
+      });
+      expect(result.patch.status).not.toBe("done");
+      expect(result.patch.status).toBe("in_progress");
+      expect(result.patch.assigneeAgentId).toBe(coderAgentId);
+      expect(result.patch.executionState).toBeNull();
+    });
+
+    it("still advances a normal approval when the ladder is unchanged (no false positive)", () => {
+      const policy = twoStagePolicy();
+      const result = applyIssueExecutionPolicyTransition({
+        issue: pendingReviewIssue(policy),
+        policy,
+        previousPolicy: policy,
+        requestedStatus: "done",
+        requestedAssigneePatch: {},
+        actor: { agentId: qaAgentId },
+        commentBody: "QA signoff",
+      });
+      expect(result.patch.executionState).toMatchObject({
+        status: "pending",
+        currentStageType: "approval",
+        currentParticipant: { type: "user", userId: ctoUserId },
+      });
+      expect(result.decision).toMatchObject({ stageType: "review", outcome: "approved" });
+    });
+
+    it("allows re-sending an identically-shaped ladder (same ids) during an active stage", () => {
+      const policy = twoStagePolicy();
+      // Mirror the route normalizing req.body.executionPolicy that carries the
+      // same stage/participant ids: a fresh object, identical ladder signature.
+      const resent = normalizeIssueExecutionPolicy({
+        stages: policy.stages.map((stage) => ({
+          id: stage.id,
+          type: stage.type,
+          participants: stage.participants.map((participant) => ({
+            id: participant.id,
+            type: participant.type,
+            agentId: participant.agentId ?? undefined,
+            userId: participant.userId ?? undefined,
+          })),
+        })),
+      })!;
+      expect(() =>
+        applyIssueExecutionPolicyTransition({
+          issue: pendingReviewIssue(policy),
+          policy: resent,
+          previousPolicy: policy,
+          requestedStatus: "done",
+          requestedAssigneePatch: {},
+          actor: { agentId: qaAgentId },
+          commentBody: "QA signoff",
+        }),
+      ).not.toThrow();
+    });
+
+    it("rejects clearing the policy (executionPolicy:null) with status:done during changes_requested (vector 3)", () => {
+      const previousPolicy = twoStagePolicy();
+      const reviewStageId = previousPolicy.stages[0].id;
+      // Clearing the policy is the extreme ladder change (all stages removed) and
+      // must be rejected when paired with terminal `done`, NOT silently applied —
+      // otherwise the gate is removed and `done` is reachable by a follow-up PATCH.
+      expect(() =>
+        applyIssueExecutionPolicyTransition({
+          issue: {
+            status: "in_progress",
+            assigneeAgentId: coderAgentId,
+            assigneeUserId: null,
+            executionPolicy: previousPolicy,
+            executionState: {
+              status: "changes_requested",
+              currentStageId: reviewStageId,
+              currentStageIndex: 0,
+              currentStageType: "review",
+              currentParticipant: { type: "agent", agentId: qaAgentId },
+              returnAssignee: { type: "agent", agentId: coderAgentId },
+              completedStageIds: [],
+              lastDecisionId: null,
+              lastDecisionOutcome: "changes_requested",
+            },
+          },
+          policy: null,
+          previousPolicy,
+          requestedStatus: "done",
+          requestedAssigneePatch: {},
+          actor: { agentId: coderAgentId },
+          commentBody: "done",
+        }),
+      ).toThrow("Cannot modify execution policy stages while a review or approval stage is active");
+    });
+
+    it("rejects clearing the policy with status:done when there is no return assignee", () => {
+      const previousPolicy = twoStagePolicy();
+      const reviewStageId = previousPolicy.stages[0].id;
+      expect(() =>
+        applyIssueExecutionPolicyTransition({
+          issue: {
+            status: "in_review",
+            assigneeAgentId: qaAgentId,
+            assigneeUserId: null,
+            executionPolicy: previousPolicy,
+            executionState: {
+              status: "pending",
+              currentStageId: reviewStageId,
+              currentStageIndex: 0,
+              currentStageType: "review",
+              currentParticipant: { type: "agent", agentId: qaAgentId },
+              returnAssignee: null,
+              completedStageIds: [],
+              lastDecisionId: null,
+              lastDecisionOutcome: null,
+            },
+          },
+          policy: null,
+          previousPolicy,
+          requestedStatus: "done",
+          requestedAssigneePatch: {},
+          actor: { agentId: qaAgentId },
+          commentBody: "ship",
+        }),
+      ).toThrow("Cannot modify execution policy stages while a review or approval stage is active");
+    });
+
+    it("still clears the policy normally (waive) without a status change", () => {
+      const previousPolicy = twoStagePolicy();
+      const reviewStageId = previousPolicy.stages[0].id;
+      const result = applyIssueExecutionPolicyTransition({
+        issue: {
+          status: "in_review",
+          assigneeAgentId: qaAgentId,
+          assigneeUserId: null,
+          executionPolicy: previousPolicy,
+          executionState: {
+            status: "pending",
+            currentStageId: reviewStageId,
+            currentStageIndex: 0,
+            currentStageType: "review",
+            currentParticipant: { type: "agent", agentId: qaAgentId },
+            returnAssignee: { type: "agent", agentId: coderAgentId },
+            completedStageIds: [],
+            lastDecisionId: null,
+            lastDecisionOutcome: null,
+          },
+        },
+        policy: null,
+        previousPolicy,
+        requestedAssigneePatch: {},
+        actor: { agentId: ctoAgentId },
+      });
+      // Waive (no status change): existing behavior — return to the dev in_progress.
+      expect(result.patch.status).toBe("in_progress");
+      expect(result.patch.assigneeAgentId).toBe(coderAgentId);
+      expect(result.patch.executionState).toBeNull();
+    });
+
+    it("rejects duplicate stage ids in normalizeIssueExecutionPolicy (T14)", () => {
+      const dupId = "11111111-2222-4333-8444-555555555555";
+      expect(() =>
+        normalizeIssueExecutionPolicy({
+          stages: [
+            { id: dupId, type: "review", participants: [{ type: "agent", agentId: qaAgentId }] },
+            { id: dupId, type: "approval", participants: [{ type: "user", userId: ctoUserId }] },
+          ],
+        }),
+      ).toThrow("Execution policy stages must have unique ids");
+    });
+  });
 });

@@ -141,7 +141,7 @@ export const AGENT_ICON_NAMES = [
 export type AgentIconName = (typeof AGENT_ICON_NAMES)[number];
 
 /**
- * Curated Lucide icon set for projects (PAP-68 part 3).
+ * Curated Lucide icon set for projects.
  *
  * The first entry, `"folder"`, is the default for any project without an
  * explicit icon. The remaining entries reuse much of the agent icon set plus a
@@ -925,6 +925,12 @@ export const PERMISSION_KEYS = [
   "tasks:manage_active_checkouts",
   "pipelines:write",
   "joins:approve",
+  // Authority to create, modify, or clear an issue's execution-policy stage
+  // ladder while a ladder is already attached. Default
+  // deny: only principals with an explicit grant (e.g. a release/recovery agent)
+  // or board users may waive/repair an in-flight gate. Never granted to the
+  // work-actor whose `done` the gate constrains.
+  "execution_policy:manage",
 ] as const;
 export type PermissionKey = (typeof PERMISSION_KEYS)[number];
 
