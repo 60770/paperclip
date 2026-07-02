@@ -452,6 +452,8 @@ export const updateIssueSchema = createIssueBaseSchema.omit({ watchdog: true }).
   assigneeAgentId: z.string().trim().min(1).optional().nullable(),
   comment: multilineTextSchema.pipe(z.string().min(1)).optional(),
   reviewRequest: issueReviewRequestSchema.optional().nullable(),
+  reopenPriorStages: z.boolean().optional(),
+  expectedFixForwardIid: z.number().int().positive().optional().nullable(),
   reopen: z.boolean().optional(),
   resume: z.boolean().optional(),
   interrupt: z.boolean().optional(),

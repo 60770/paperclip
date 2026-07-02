@@ -496,6 +496,7 @@ export interface IssueExecutionDecision {
   actorUserId: string | null;
   outcome: IssueExecutionDecisionOutcome;
   body: string;
+  metadata: Record<string, unknown> | null;
   createdByRunId: string | null;
   createdAt: Date;
   updatedAt: Date;

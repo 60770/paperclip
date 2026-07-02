@@ -21,6 +21,14 @@ function twoStagePolicy() {
   ]);
 }
 
+function twoReviewApprovalPolicy() {
+  return makePolicy([
+    { type: "review", participants: [{ type: "agent", agentId: qaAgentId }] },
+    { type: "review", participants: [{ type: "agent", agentId: ctoAgentId }] },
+    { type: "approval", participants: [{ type: "user", userId: ctoUserId }] },
+  ]);
+}
+
 function reviewOnlyPolicy() {
   return makePolicy([
     { type: "review", participants: [{ type: "agent", agentId: qaAgentId }] },
@@ -453,6 +461,7 @@ describe("issue execution policy transitions", () => {
         requestedAssigneePatch: {},
         actor: { agentId: coderAgentId },
         commentBody: "Fixed edge cases",
+        reopenPriorStages: true,
       });
 
       expect(result.patch.status).toBe("in_review");
@@ -463,6 +472,242 @@ describe("issue execution policy transitions", () => {
         currentStageType: "review",
         currentParticipant: { type: "agent", agentId: qaAgentId },
       });
+    });
+
+    it("approver can request changes and reopen completed review stages", () => {
+      const policy = twoReviewApprovalPolicy();
+      const firstReviewStageId = policy.stages[0].id;
+      const secondReviewStageId = policy.stages[1].id;
+      const approvalStageId = policy.stages[2].id;
+
+      const result = applyIssueExecutionPolicyTransition({
+        issue: {
+          status: "in_review",
+          assigneeAgentId: null,
+          assigneeUserId: ctoUserId,
+          executionPolicy: policy,
+          executionState: {
+            status: "pending",
+            currentStageId: approvalStageId,
+            currentStageIndex: 2,
+            currentStageType: "approval",
+            currentParticipant: { type: "user", userId: ctoUserId },
+            returnAssignee: { type: "agent", agentId: coderAgentId },
+            completedStageIds: [firstReviewStageId, secondReviewStageId],
+            lastDecisionId: null,
+            lastDecisionOutcome: "approved",
+          },
+        },
+        policy,
+        requestedStatus: "in_progress",
+        requestedAssigneePatch: {},
+        actor: { userId: ctoUserId },
+        commentBody: "Main failed; fix-forward needs a fresh review pass",
+        reopenPriorStages: true,
+        expectedFixForwardIid: 176,
+      });
+
+      expect(result.patch.status).toBe("in_progress");
+      expect(result.patch.assigneeAgentId).toBe(coderAgentId);
+      expect(result.patch.assigneeUserId).toBeNull();
+      expect(result.patch.executionState).toMatchObject({
+        status: "changes_requested",
+        currentStageId: firstReviewStageId,
+        currentStageIndex: 0,
+        currentStageType: "review",
+        currentParticipant: { type: "agent", agentId: qaAgentId },
+        completedStageIds: [],
+        lastDecisionOutcome: "changes_requested",
+      });
+      expect((result.patch.executionState as IssueExecutionState).completedStageIds).not.toContain(approvalStageId);
+      expect(result.decision).toMatchObject({
+        stageId: approvalStageId,
+        stageType: "approval",
+        outcome: "changes_requested",
+        metadata: {
+          reopenPriorStages: true,
+          reopenedStageIds: [firstReviewStageId, secondReviewStageId],
+          expectedFixForwardIid: 176,
+        },
+      });
+    });
+
+    it("keeps normal approval changes requested on the approval stage without reopenPriorStages", () => {
+      const approvalStageId = policy.stages[1].id;
+      const result = applyIssueExecutionPolicyTransition({
+        issue: {
+          status: "in_review",
+          assigneeAgentId: null,
+          assigneeUserId: ctoUserId,
+          executionPolicy: policy,
+          executionState: {
+            status: "pending",
+            currentStageId: approvalStageId,
+            currentStageIndex: 1,
+            currentStageType: "approval",
+            currentParticipant: { type: "user", userId: ctoUserId },
+            returnAssignee: { type: "agent", agentId: coderAgentId },
+            completedStageIds: [reviewStageId],
+            lastDecisionId: null,
+            lastDecisionOutcome: "approved",
+          },
+        },
+        policy,
+        requestedStatus: "in_progress",
+        requestedAssigneePatch: {},
+        actor: { userId: ctoUserId },
+        commentBody: "Needs one more implementation pass",
+      });
+
+      expect(result.patch.executionState).toMatchObject({
+        status: "changes_requested",
+        currentStageId: approvalStageId,
+        currentStageType: "approval",
+        completedStageIds: [reviewStageId],
+      });
+      expect(result.decision).toMatchObject({
+        stageId: approvalStageId,
+        stageType: "approval",
+        outcome: "changes_requested",
+        metadata: null,
+      });
+    });
+
+    it("ignores reopenPriorStages on review-stage changes requested", () => {
+      const result = applyIssueExecutionPolicyTransition({
+        issue: {
+          status: "in_review",
+          assigneeAgentId: qaAgentId,
+          assigneeUserId: null,
+          executionPolicy: policy,
+          executionState: {
+            status: "pending",
+            currentStageId: reviewStageId,
+            currentStageIndex: 0,
+            currentStageType: "review",
+            currentParticipant: { type: "agent", agentId: qaAgentId },
+            returnAssignee: { type: "agent", agentId: coderAgentId },
+            completedStageIds: [],
+            lastDecisionId: null,
+            lastDecisionOutcome: null,
+          },
+        },
+        policy,
+        requestedStatus: "in_progress",
+        requestedAssigneePatch: {},
+        actor: { agentId: qaAgentId },
+        commentBody: "Still needs work",
+        reopenPriorStages: true,
+      });
+
+      expect(result.patch.executionState).toMatchObject({
+        status: "changes_requested",
+        currentStageId: reviewStageId,
+        currentStageType: "review",
+      });
+      expect(result.decision).toMatchObject({ stageType: "review", outcome: "changes_requested", metadata: null });
+    });
+
+    it("rejects reopenPriorStages when there are no completed review stages to reopen", () => {
+      const policy = approvalOnlyPolicy();
+      const approvalStageId = policy.stages[0].id;
+
+      expect(() =>
+        applyIssueExecutionPolicyTransition({
+          issue: {
+            status: "in_review",
+            assigneeAgentId: null,
+            assigneeUserId: ctoUserId,
+            executionPolicy: policy,
+            executionState: {
+              status: "pending",
+              currentStageId: approvalStageId,
+              currentStageIndex: 0,
+              currentStageType: "approval",
+              currentParticipant: { type: "user", userId: ctoUserId },
+              returnAssignee: { type: "agent", agentId: coderAgentId },
+              completedStageIds: [],
+              lastDecisionId: null,
+              lastDecisionOutcome: null,
+            },
+          },
+          policy,
+          requestedStatus: "in_progress",
+          requestedAssigneePatch: {},
+          actor: { userId: ctoUserId },
+          commentBody: "Needs review stages reopened",
+          reopenPriorStages: true,
+        }),
+      ).toThrow("No prior completed review stages can be reopened");
+    });
+
+    it("rejects reopenPriorStages when the active approval stage is already completed", () => {
+      const approvalStageId = policy.stages[1].id;
+
+      expect(() =>
+        applyIssueExecutionPolicyTransition({
+          issue: {
+            status: "in_review",
+            assigneeAgentId: null,
+            assigneeUserId: ctoUserId,
+            executionPolicy: policy,
+            executionState: {
+              status: "pending",
+              currentStageId: approvalStageId,
+              currentStageIndex: 1,
+              currentStageType: "approval",
+              currentParticipant: { type: "user", userId: ctoUserId },
+              returnAssignee: { type: "agent", agentId: coderAgentId },
+              completedStageIds: [reviewStageId, approvalStageId],
+              lastDecisionId: null,
+              lastDecisionOutcome: "approved",
+            },
+          },
+          policy,
+          requestedStatus: "in_progress",
+          requestedAssigneePatch: {},
+          actor: { userId: ctoUserId },
+          commentBody: "Needs review stages reopened",
+          reopenPriorStages: true,
+        }),
+      ).toThrow("Cannot reopen review stages after the approval stage has completed");
+    });
+
+    it("rejects reopenPriorStages when a reopened review stage has no non-return-assignee participant", () => {
+      const policy = makePolicy([
+        { type: "review", participants: [{ type: "agent", agentId: coderAgentId }] },
+        { type: "approval", participants: [{ type: "user", userId: ctoUserId }] },
+      ]);
+      const reviewStageId = policy.stages[0].id;
+      const approvalStageId = policy.stages[1].id;
+
+      expect(() =>
+        applyIssueExecutionPolicyTransition({
+          issue: {
+            status: "in_review",
+            assigneeAgentId: null,
+            assigneeUserId: ctoUserId,
+            executionPolicy: policy,
+            executionState: {
+              status: "pending",
+              currentStageId: approvalStageId,
+              currentStageIndex: 1,
+              currentStageType: "approval",
+              currentParticipant: { type: "user", userId: ctoUserId },
+              returnAssignee: { type: "agent", agentId: coderAgentId },
+              completedStageIds: [reviewStageId],
+              lastDecisionId: null,
+              lastDecisionOutcome: "approved",
+            },
+          },
+          policy,
+          requestedStatus: "in_progress",
+          requestedAssigneePatch: {},
+          actor: { userId: ctoUserId },
+          commentBody: "Needs review stages reopened",
+          reopenPriorStages: true,
+        }),
+      ).toThrow("No eligible review participant is configured for a reopened stage");
     });
   });
 

@@ -6050,6 +6050,8 @@ export function issueRoutes(
       },
       commentBody,
       reviewRequest: reviewRequest === undefined ? undefined : reviewRequest,
+      reopenPriorStages: req.body.reopenPriorStages === true,
+      expectedFixForwardIid: req.body.expectedFixForwardIid ?? null,
       monitorExplicitlyUpdated: req.body.executionPolicy !== undefined && monitorChanged,
     });
     const decisionId = transition.decision ? randomUUID() : null;
@@ -6148,6 +6150,7 @@ export function issueRoutes(
             actorUserId: actor.actorType === "user" ? actor.actorId : null,
             outcome: decision.outcome,
             body: decision.body,
+            metadata: decision.metadata ?? null,
             createdByRunId: actor.runId ?? null,
           });
 
@@ -7920,6 +7923,7 @@ export function issueRoutes(
               actorUserId: actor.actorType === "user" ? actor.actorId : null,
               outcome: transition.decision.outcome,
               body: transition.decision.body,
+              metadata: transition.decision.metadata ?? null,
               createdByRunId: actor.runId ?? null,
             });
           }

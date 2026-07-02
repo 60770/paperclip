@@ -48,6 +48,19 @@ describe("issue validators", () => {
     expect(parsed.comment).toBe("Done\n\n- Verified the route");
   });
 
+  it("accepts execution-policy reopen controls on issue updates", () => {
+    const parsed = updateIssueSchema.parse({
+      status: "in_progress",
+      comment: "Main pipeline failed",
+      reopenPriorStages: true,
+      expectedFixForwardIid: 176,
+    });
+
+    expect(parsed.reopenPriorStages).toBe(true);
+    expect(parsed.expectedFixForwardIid).toBe(176);
+    expect(updateIssueSchema.safeParse({ expectedFixForwardIid: 0 }).success).toBe(false);
+  });
+
   it("allows false-positive recovery resolutions to atomically restore the source issue status", () => {
     expect(
       resolveIssueRecoveryActionSchema.parse({

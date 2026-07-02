@@ -49,12 +49,18 @@ type TransitionInput = {
   actor: ActorLike;
   commentBody?: string | null;
   reviewRequest?: IssueExecutionState["reviewRequest"] | null;
+  reopenPriorStages?: boolean;
+  expectedFixForwardIid?: number | null;
   monitorExplicitlyUpdated?: boolean;
+};
+
+type ExecutionDecisionPatch = Pick<IssueExecutionDecision, "stageId" | "stageType" | "outcome" | "body"> & {
+  metadata?: Record<string, unknown> | null;
 };
 
 type TransitionResult = {
   patch: Record<string, unknown>;
-  decision?: Pick<IssueExecutionDecision, "stageId" | "stageType" | "outcome" | "body">;
+  decision?: ExecutionDecisionPatch;
   workflowControlledAssignment?: boolean;
 };
 
@@ -600,6 +606,67 @@ function buildChangesRequestedState(previous: IssueExecutionState, currentStage:
   };
 }
 
+function buildReopenPriorStagesChangesRequestedState(input: {
+  previous: IssueExecutionState;
+  policy: IssueExecutionPolicy;
+  approvalStage: IssueExecutionStage;
+  expectedFixForwardIid?: number | null;
+}): { state: IssueExecutionState; metadata: Record<string, unknown> } {
+  const approvalStageIndex = input.policy.stages.findIndex((stage) => stage.id === input.approvalStage.id);
+  if (approvalStageIndex < 0) {
+    throw unprocessable("Active approval stage is not present in the execution policy");
+  }
+
+  const completedStageIds = new Set(input.previous.completedStageIds);
+  if (completedStageIds.has(input.approvalStage.id)) {
+    throw unprocessable("Cannot reopen review stages after the approval stage has completed");
+  }
+
+  const returnAssignee = input.previous.returnAssignee;
+  const reopenedStages = input.policy.stages
+    .slice(0, approvalStageIndex)
+    .filter((stage) => stage.type === "review" && completedStageIds.has(stage.id));
+
+  if (reopenedStages.length === 0) {
+    throw unprocessable("No prior completed review stages can be reopened");
+  }
+
+  for (const stage of reopenedStages) {
+    const participant = selectStageParticipant(stage, { exclude: returnAssignee });
+    if (!participant) {
+      throw unprocessable("No eligible review participant is configured for a reopened stage");
+    }
+  }
+
+  const reopenedStageIds = reopenedStages.map((stage) => stage.id);
+  const reopenedStageIdSet = new Set(reopenedStageIds);
+  const firstReopenedStage = reopenedStages[0];
+  const firstReopenedStageIndex = input.policy.stages.findIndex((stage) => stage.id === firstReopenedStage.id);
+  const firstParticipant = selectStageParticipant(firstReopenedStage, { exclude: returnAssignee });
+  if (!firstParticipant) {
+    throw unprocessable("No eligible review participant is configured for a reopened stage");
+  }
+
+  return {
+    state: {
+      ...input.previous,
+      status: CHANGES_REQUESTED_STATUS,
+      currentStageId: firstReopenedStage.id,
+      currentStageIndex: firstReopenedStageIndex,
+      currentStageType: firstReopenedStage.type,
+      currentParticipant: firstParticipant,
+      reviewRequest: null,
+      completedStageIds: input.previous.completedStageIds.filter((stageId) => !reopenedStageIdSet.has(stageId)),
+      lastDecisionOutcome: "changes_requested",
+    },
+    metadata: {
+      reopenPriorStages: true,
+      reopenedStageIds,
+      expectedFixForwardIid: input.expectedFixForwardIid ?? null,
+    },
+  };
+}
+
 function buildPendingStagePatch(input: {
   patch: Record<string, unknown>;
   previous: IssueExecutionState | null;
@@ -844,9 +911,18 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
         if (!existingState?.returnAssignee) {
           throw unprocessable("This execution stage has no return assignee");
         }
+        const reopenPriorStages =
+          input.reopenPriorStages === true && activeStage.type === "approval"
+            ? buildReopenPriorStagesChangesRequestedState({
+                previous: existingState,
+                policy: input.policy,
+                approvalStage: activeStage,
+                expectedFixForwardIid: input.expectedFixForwardIid,
+              })
+            : null;
         patch.status = "in_progress";
         Object.assign(patch, patchForPrincipal(existingState.returnAssignee));
-        patch.executionState = buildChangesRequestedState(existingState, activeStage);
+        patch.executionState = reopenPriorStages?.state ?? buildChangesRequestedState(existingState, activeStage);
         return {
           patch,
           decision: {
@@ -854,6 +930,7 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
             stageType: activeStage.type,
             outcome: "changes_requested",
             body: input.commentBody.trim(),
+            metadata: reopenPriorStages?.metadata ?? null,
           },
           workflowControlledAssignment: true,
         };
