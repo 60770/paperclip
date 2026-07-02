@@ -430,6 +430,44 @@ describe("issue execution policy routes", () => {
     expect(mockIssueApprovalService.listApprovalsForIssue).not.toHaveBeenCalled();
   });
 
+  it("keeps reopen decision modifiers out of ordinary issue update fields", async () => {
+    const issue = {
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      companyId: "company-1",
+      status: "in_progress",
+      assigneeAgentId: "33333333-3333-4333-8333-333333333333",
+      assigneeUserId: null,
+      createdByUserId: "local-board",
+      identifier: "issue-1008",
+      title: "Control field no-op",
+      executionPolicy: null,
+      executionState: null,
+    };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...issue,
+      ...patch,
+      updatedAt: new Date(),
+    }));
+
+    const res = await request(await createApp())
+      .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+      .send({ reopenPriorStages: true, expectedFixForwardIid: 176 });
+
+    expect(res.status).toBe(200);
+    const patch = mockIssueService.update.mock.calls[0]?.[1] as Record<string, unknown>;
+    expect(patch).not.toHaveProperty("reopenPriorStages");
+    expect(patch).not.toHaveProperty("expectedFixForwardIid");
+    expect(patch).toMatchObject({
+      actorAgentId: null,
+      actorUserId: "local-board",
+    });
+    const issueUpdatedCall = mockLogActivity.mock.calls.find((call) => call[1]?.action === "issue.updated");
+    const details = issueUpdatedCall?.[1]?.details as Record<string, unknown>;
+    expect(details).not.toHaveProperty("reopenPriorStages");
+    expect(details).not.toHaveProperty("expectedFixForwardIid");
+  });
+
   it("does not auto-start execution review when reviewers are added to an already in_review issue", async () => {
     const policy = normalizeIssueExecutionPolicy({
       stages: [

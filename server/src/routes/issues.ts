@@ -5826,6 +5826,8 @@ export function issueRoutes(
       resume: resumeRequested,
       interrupt: interruptRequested,
       hiddenAt: hiddenAtRaw,
+      reopenPriorStages,
+      expectedFixForwardIid,
       ...updateFields
     } = req.body;
     const shouldCancelActiveRunForCancelledStatus =
@@ -6050,8 +6052,8 @@ export function issueRoutes(
       },
       commentBody,
       reviewRequest: reviewRequest === undefined ? undefined : reviewRequest,
-      reopenPriorStages: req.body.reopenPriorStages === true,
-      expectedFixForwardIid: req.body.expectedFixForwardIid ?? null,
+      reopenPriorStages: reopenPriorStages === true,
+      expectedFixForwardIid: expectedFixForwardIid ?? null,
       monitorExplicitlyUpdated: req.body.executionPolicy !== undefined && monitorChanged,
     });
     const decisionId = transition.decision ? randomUUID() : null;
