@@ -1215,14 +1215,14 @@ const server = createServer(async (req, res) => {
     const contentType = typeof req.headers["content-type"] === "string" ? req.headers["content-type"] : "";
     const method = req.method || "GET";
     const isAttachmentUpload = method === "POST" && issueAttachmentUploadPath.test(url.pathname) && /^multipart\\/form-data(?:;|$)/i.test(contentType.trim());
-    if (method !== "GET" && method !== "HEAD" && !isAttachmentUpload && !/json/i.test(contentType)) {
+    const requestBody = await readBody(req, isAttachmentUpload ? maxAttachmentBodyBytes : maxBodyBytes);
+    if (method !== "GET" && method !== "HEAD" && requestBody.byteLength > 0 && !isAttachmentUpload && !/json/i.test(contentType)) {
       res.statusCode = 415;
       res.setHeader("content-type", "application/json");
       res.end(JSON.stringify({ error: "Bridge only accepts JSON request bodies." }));
       return;
     }
     const requestId = randomUUID();
-    const requestBody = await readBody(req, isAttachmentUpload ? maxAttachmentBodyBytes : maxBodyBytes);
     const payload = {
       id: requestId,
       method,
