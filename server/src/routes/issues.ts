@@ -10409,13 +10409,9 @@ export function issueRoutes(
     const companyId = req.params.companyId as string;
     const issueId = req.params.issueId as string;
     assertCompanyAccess(req, companyId);
-    const issue = await svc.getById(issueId);
+    const issue = await svc.getByIdForCompany(companyId, issueId);
     if (!issue) {
       res.status(404).json({ error: "Issue not found" });
-      return;
-    }
-    if (issue.companyId !== companyId) {
-      res.status(422).json({ error: "Issue does not belong to company" });
       return;
     }
     if (!(await assertAgentIssueMutationAllowed(req, res, issue))) return;
@@ -10455,6 +10451,12 @@ export function issueRoutes(
       return;
     }
 
+    await svc.validateAttachmentComment({
+      companyId,
+      issueId,
+      issueCommentId: parsedMeta.data.issueCommentId ?? null,
+    });
+
     const actor = getActorInfo(req);
     const stored = await storage.putFile({
       companyId,
@@ -10464,18 +10466,31 @@ export function issueRoutes(
       body: file.buffer,
     });
 
-    const attachment = await svc.createAttachment({
-      issueId,
-      issueCommentId: parsedMeta.data.issueCommentId ?? null,
-      provider: stored.provider,
-      objectKey: stored.objectKey,
-      contentType: stored.contentType,
-      byteSize: stored.byteSize,
-      sha256: stored.sha256,
-      originalFilename: stored.originalFilename,
-      createdByAgentId: actor.agentId,
-      createdByUserId: actor.actorType === "user" ? actor.actorId : null,
-    });
+    let attachment;
+    try {
+      attachment = await svc.createAttachment({
+        issueId,
+        issueCommentId: parsedMeta.data.issueCommentId ?? null,
+        provider: stored.provider,
+        objectKey: stored.objectKey,
+        contentType: stored.contentType,
+        byteSize: stored.byteSize,
+        sha256: stored.sha256,
+        originalFilename: stored.originalFilename,
+        createdByAgentId: actor.agentId,
+        createdByUserId: actor.actorType === "user" ? actor.actorId : null,
+      });
+    } catch (err) {
+      try {
+        await storage.deleteObject(companyId, stored.objectKey);
+      } catch (cleanupError) {
+        logger.warn(
+          { err: cleanupError, objectKey: stored.objectKey },
+          "storage cleanup failed after attachment persistence error",
+        );
+      }
+      throw err;
+    }
 
     await logActivity(db, {
       companyId,
