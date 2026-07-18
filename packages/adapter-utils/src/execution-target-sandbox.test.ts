@@ -1034,6 +1034,92 @@ describe("sandbox adapter execution targets", () => {
     }
   });
 
+  it("forwards multipart issue attachments byte-for-byte through the sandbox bridge", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-execution-target-bridge-attachment-"));
+    cleanupDirs.push(rootDir);
+    const remoteCwd = path.join(rootDir, "workspace");
+    const runtimeRootDir = path.join(remoteCwd, ".paperclip-runtime", "codex");
+    await mkdir(runtimeRootDir, { recursive: true });
+
+    const boundary = "paperclip-bridge-test-boundary";
+    const binaryFile = Buffer.from([0x00, 0xff, 0x10, 0x80, 0x41, 0x0a]);
+    const multipartBody = Buffer.concat([
+      Buffer.from(
+        `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="evidence.bin"\r\nContent-Type: application/octet-stream\r\n\r\n`,
+        "utf8",
+      ),
+      binaryFile,
+      Buffer.from(`\r\n--${boundary}--\r\n`, "utf8"),
+    ]);
+    let receivedBody = Buffer.alloc(0);
+    let receivedContentType: string | null = null;
+    let receivedAuthorization: string | null = null;
+    const apiServer = createServer(async (req, res) => {
+      receivedContentType = typeof req.headers["content-type"] === "string"
+        ? req.headers["content-type"]
+        : null;
+      receivedAuthorization = req.headers.authorization ?? null;
+      const chunks: Buffer[] = [];
+      for await (const chunk of req) {
+        chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+      }
+      receivedBody = Buffer.concat(chunks);
+      res.writeHead(201, { "content-type": "application/json" });
+      res.end(JSON.stringify({ id: "attachment-1" }));
+    });
+    await new Promise<void>((resolve, reject) => {
+      apiServer.once("error", reject);
+      apiServer.listen(0, "127.0.0.1", () => resolve());
+    });
+    const address = apiServer.address();
+    if (!address || typeof address === "string") {
+      throw new Error("Expected the attachment bridge API server to listen on a TCP port.");
+    }
+
+    const target: AdapterSandboxExecutionTarget = {
+      kind: "remote",
+      transport: "sandbox",
+      providerKey: "e2b",
+      environmentId: "env-1",
+      leaseId: "lease-1",
+      remoteCwd,
+      runner: createLocalSandboxRunner(),
+      timeoutMs: 30_000,
+    };
+    const bridge = await startAdapterExecutionTargetPaperclipBridge({
+      runId: "run-bridge-attachment",
+      target,
+      runtimeRootDir,
+      adapterKey: "codex",
+      hostApiToken: "real-run-jwt",
+      hostApiUrl: `http://127.0.0.1:${address.port}`,
+      maxAttachmentBodyBytes: multipartBody.byteLength,
+    });
+    try {
+      const response = await fetch(
+        `${bridge!.env.PAPERCLIP_API_URL}/api/companies/company-1/issues/issue-1/attachments`,
+        {
+          method: "POST",
+          headers: {
+            authorization: `Bearer ${bridge!.env.PAPERCLIP_API_KEY}`,
+            "content-type": `multipart/form-data; boundary=${boundary}`,
+          },
+          body: new Uint8Array(multipartBody),
+        },
+      );
+
+      expect(response.status).toBe(201);
+      await expect(response.json()).resolves.toEqual({ id: "attachment-1" });
+      expect(receivedContentType).toBe(`multipart/form-data; boundary=${boundary}`);
+      expect(receivedAuthorization).toBe("Bearer real-run-jwt");
+      expect(receivedBody).toEqual(multipartBody);
+      expect(receivedBody.indexOf(binaryFile)).toBeGreaterThanOrEqual(0);
+    } finally {
+      await bridge?.stop();
+      await new Promise<void>((resolve) => apiServer.close(() => resolve()));
+    }
+  });
+
   it("defaults sandbox run log streaming on and honors the explicit opt-out", async () => {
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-execution-target-bridge-stream-default-"));
     cleanupDirs.push(rootDir);
