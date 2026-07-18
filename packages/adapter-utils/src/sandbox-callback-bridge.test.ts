@@ -641,6 +641,19 @@ describe("sandbox callback bridge", () => {
     await expect(nonJsonResponse.json()).resolves.toEqual({
       error: "Bridge only accepts JSON request bodies.",
     });
+
+    const unrelatedMultipartResponse = await fetch(`${bridge.baseUrl}/api/issues/issue-1/comments`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${bridgeToken}`,
+        "content-type": "multipart/form-data; boundary=not-an-attachment",
+      },
+      body: "--not-an-attachment--",
+    });
+    expect(unrelatedMultipartResponse.status).toBe(415);
+    await expect(unrelatedMultipartResponse.json()).resolves.toEqual({
+      error: "Bridge only accepts JSON request bodies.",
+    });
   });
 
   it("returns a 502 when the host response times out", async () => {
@@ -896,6 +909,9 @@ describe("sandbox callback bridge", () => {
       { method: "POST", path: "/api/issues/issue-1/release" },
       { method: "PATCH", path: "/api/issues/issue-1" },
       { method: "GET", path: "/api/issues/issue-1/approvals" },
+      { method: "GET", path: "/api/issues/issue-1/attachments" },
+      { method: "POST", path: "/api/companies/co-1/issues/issue-1/attachments" },
+      { method: "DELETE", path: "/api/attachments/attachment-1" },
       { method: "GET", path: "/api/issues/issue-1/work-products" },
       { method: "POST", path: "/api/issues/issue-1/work-products" },
       { method: "PATCH", path: "/api/work-products/wp-1" },
