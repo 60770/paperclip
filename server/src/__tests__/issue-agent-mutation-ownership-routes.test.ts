@@ -14,11 +14,13 @@ const mockIssueService = vi.hoisted(() => ({
   addComment: vi.fn(),
   assertCheckoutOwner: vi.fn(),
   create: vi.fn(),
+  createAttachment: vi.fn(),
   createChild: vi.fn(),
   decomposeAcceptedPlan: vi.fn(),
   getAttachmentById: vi.fn(),
   getByIdentifier: vi.fn(),
   getById: vi.fn(),
+  getByIdForCompany: vi.fn(),
   getComment: vi.fn(),
   getRelationSummaries: vi.fn(),
   getWakeableParentAfterChildCompletion: vi.fn(),
@@ -29,6 +31,7 @@ const mockIssueService = vi.hoisted(() => ({
   remove: vi.fn(),
   removeAttachment: vi.fn(),
   update: vi.fn(),
+  validateAttachmentComment: vi.fn(),
   findMentionedAgents: vi.fn(),
 }));
 
@@ -409,11 +412,13 @@ describe("agent issue mutation checkout ownership", () => {
     mockIssueService.addComment.mockReset();
     mockIssueService.assertCheckoutOwner.mockReset();
     mockIssueService.create.mockReset();
+    mockIssueService.createAttachment.mockReset();
     mockIssueService.createChild.mockReset();
     mockIssueService.decomposeAcceptedPlan.mockReset();
     mockIssueService.getAttachmentById.mockReset();
     mockIssueService.getByIdentifier.mockReset();
     mockIssueService.getById.mockReset();
+    mockIssueService.getByIdForCompany.mockReset();
     mockIssueService.getComment.mockReset();
     mockIssueService.getRelationSummaries.mockReset();
     mockIssueService.getWakeableParentAfterChildCompletion.mockReset();
@@ -498,6 +503,7 @@ describe("agent issue mutation checkout ownership", () => {
     mockIssueService.remove.mockReset();
     mockIssueService.removeAttachment.mockReset();
     mockIssueService.update.mockReset();
+    mockIssueService.validateAttachmentComment.mockReset();
     mockIssueService.findMentionedAgents.mockReset();
     mockLogActivity.mockClear();
     mockDocumentService.upsertIssueDocument.mockReset();
@@ -531,7 +537,9 @@ describe("agent issue mutation checkout ownership", () => {
     mockAgentService.resolveByReference.mockResolvedValue({ ambiguous: false, agent: null });
     mockCompanyService.getById.mockResolvedValue({ id: companyId, issuePrefix: "PAP" });
     mockIssueService.getById.mockResolvedValue(makeIssue());
+    mockIssueService.getByIdForCompany.mockResolvedValue(makeIssue());
     mockIssueService.getByIdentifier.mockResolvedValue(null);
+    mockIssueService.validateAttachmentComment.mockResolvedValue(undefined);
     mockIssueService.getComment.mockResolvedValue({
       id: "comment-1",
       issueId,
@@ -615,6 +623,15 @@ describe("agent issue mutation checkout ownership", () => {
       contentType: "text/plain",
       byteSize: 6,
       originalFilename: "report.txt",
+    });
+    mockIssueService.createAttachment.mockResolvedValue({
+      id: "attachment-1",
+      issueId,
+      companyId,
+      objectKey: "issues/upload.txt",
+      contentType: "text/plain",
+      byteSize: 6,
+      originalFilename: "upload.txt",
     });
     mockIssueService.removeAttachment.mockResolvedValue({
       id: "attachment-1",

@@ -160,7 +160,10 @@ describe("sandbox callback bridge", () => {
       client: createFileSystemSandboxCallbackBridgeQueueClient(),
       queueDir,
       authorizeRequest: async (request) =>
-        request.path === "/api/agents/me" ? null : `Route not allowed: ${request.method} ${request.path}`,
+        request.path === "/api/agents/me" ||
+        (request.method === "DELETE" && request.path === "/api/attachments/attachment-1")
+          ? null
+          : `Route not allowed: ${request.method} ${request.path}`,
       handleRequest: async (request) => {
         seenRequests.push({
           method: request.method,
@@ -219,6 +222,19 @@ describe("sandbox callback bridge", () => {
       path: "/api/agents/me",
     });
 
+    const deleteResponse = await fetch(`${bridge.baseUrl}/api/attachments/attachment-1`, {
+      method: "DELETE",
+      headers: {
+        authorization: `Bearer ${bridgeToken}`,
+      },
+    });
+    expect(deleteResponse.status).toBe(200);
+    await expect(deleteResponse.json()).resolves.toMatchObject({
+      ok: true,
+      method: "DELETE",
+      path: "/api/attachments/attachment-1",
+    });
+
     const deniedResponse = await fetch(`${bridge.baseUrl}/api/issues/issue-1`, {
       method: "PATCH",
       headers: {
@@ -242,7 +258,7 @@ describe("sandbox callback bridge", () => {
       error: "Invalid bridge token.",
     });
 
-    expect(seenRequests).toHaveLength(1);
+    expect(seenRequests).toHaveLength(2);
     expect(seenRequests[0]).toMatchObject({
       method: "GET",
       path: "/api/agents/me",
@@ -255,7 +271,13 @@ describe("sandbox callback bridge", () => {
     });
     expect(seenRequests[0]?.headers.authorization).toBeUndefined();
     expect(seenRequests[0]?.headers["x-paperclip-run-id"]).toBeUndefined();
-
+    expect(seenRequests[1]).toMatchObject({
+      method: "DELETE",
+      path: "/api/attachments/attachment-1",
+      body: "",
+      headers: {},
+    });
+    expect(seenRequests[1]?.headers["content-type"]).toBeUndefined();
   });
 
   it("denies non-allowlisted requests by default", async () => {

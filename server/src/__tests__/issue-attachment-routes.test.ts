@@ -7,9 +7,11 @@ import type { StorageService } from "../storage/types.js";
 
 const mockIssueService = vi.hoisted(() => ({
   getById: vi.fn(),
+  getByIdForCompany: vi.fn(),
   getByIdentifier: vi.fn(),
   createAttachment: vi.fn(),
   getAttachmentById: vi.fn(),
+  validateAttachmentComment: vi.fn(),
 }));
 const mockCompanyService = vi.hoisted(() => ({
   getById: vi.fn(),
@@ -253,6 +255,17 @@ describe("issue attachment routes", () => {
       assigneeUserId: null,
       identifier: "PAP-1",
     });
+    mockIssueService.getByIdForCompany.mockResolvedValue({
+      id: "11111111-1111-4111-8111-111111111111",
+      companyId: "company-1",
+      projectId: null,
+      parentId: null,
+      status: "todo",
+      assigneeAgentId: null,
+      assigneeUserId: null,
+      identifier: "PAP-1",
+    });
+    mockIssueService.validateAttachmentComment.mockResolvedValue(undefined);
     mockCompanyService.getById.mockResolvedValue({
       id: "company-1",
       attachmentMaxBytes: 1024 * 1024 * 1024,
@@ -392,6 +405,61 @@ describe("issue attachment routes", () => {
     expect(res.status).toBe(422);
     expect(res.body.error).toBe("Attachment exceeds 4 bytes");
     expect(mockIssueService.createAttachment).not.toHaveBeenCalled();
+  });
+
+  it("returns 404 for an issue outside the requested company without writing storage", async () => {
+    const storage = createStorageService();
+    mockIssueService.getByIdForCompany.mockResolvedValue(null);
+
+    const app = await createApp(storage);
+    const res = await request(app)
+      .post("/api/companies/company-1/issues/11111111-1111-4111-8111-111111111111/attachments")
+      .attach("file", Buffer.from("test"), { filename: "test.txt", contentType: "text/plain" });
+
+    expect(res.status).toBe(404);
+    expect(res.body.error).toBe("Issue not found");
+    expect(mockIssueService.getByIdForCompany).toHaveBeenCalledWith(
+      "company-1",
+      "11111111-1111-4111-8111-111111111111",
+    );
+    expect(storage.__calls.putFile).toBeUndefined();
+  });
+
+  it("validates the attachment comment before writing storage", async () => {
+    const storage = createStorageService();
+    const issueCommentId = "22222222-2222-4222-8222-222222222222";
+    const app = await createApp(storage);
+    const { notFound } = await import("../errors.js");
+    mockIssueService.validateAttachmentComment.mockRejectedValue(notFound("Issue comment not found"));
+    const res = await request(app)
+      .post("/api/companies/company-1/issues/11111111-1111-4111-8111-111111111111/attachments")
+      .field("issueCommentId", issueCommentId)
+      .attach("file", Buffer.from("test"), { filename: "test.txt", contentType: "text/plain" });
+
+    expect(res.status).toBe(404);
+    expect(res.body.error).toBe("Issue comment not found");
+    expect(mockIssueService.validateAttachmentComment).toHaveBeenCalledWith({
+      companyId: "company-1",
+      issueId: "11111111-1111-4111-8111-111111111111",
+      issueCommentId,
+    });
+    expect(storage.__calls.putFile).toBeUndefined();
+  });
+
+  it("deletes the stored object when attachment persistence fails", async () => {
+    const storage = createStorageService();
+    mockIssueService.createAttachment.mockRejectedValue(new Error("insert failed"));
+
+    const app = await createApp(storage);
+    const res = await request(app)
+      .post("/api/companies/company-1/issues/11111111-1111-4111-8111-111111111111/attachments")
+      .attach("file", Buffer.from("test"), { filename: "test.txt", contentType: "text/plain" });
+
+    expect(res.status).toBe(500);
+    expect(storage.deleteObject).toHaveBeenCalledWith(
+      "company-1",
+      "issues/11111111-1111-4111-8111-111111111111/test.txt",
+    );
   });
 
   it("serves html attachments as downloads with nosniff", async () => {
