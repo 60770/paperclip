@@ -388,12 +388,29 @@ function preferredSandboxShell(target: AdapterSandboxExecutionTarget): "bash" | 
 
 type AdapterCommandCapableExecutionTarget = AdapterSshExecutionTarget | AdapterSandboxExecutionTarget;
 
-function adapterExecutionTargetCommandRunner(target: AdapterCommandCapableExecutionTarget): CommandManagedRuntimeRunner {
+function sandboxCallbackBridgeSshMaxBufferBytes(
+  maxBodyBytes: number,
+  maxAttachmentBodyBytes: number,
+): number {
+  // The multipart body is base64 in the queue JSON, then the SSH read command
+  // base64-encodes that file again before returning it to the host.
+  const requestBodyBytes = Math.max(maxBodyBytes, maxAttachmentBodyBytes);
+  const encodedRequestBodyBytes = 4 * Math.ceil(requestBodyBytes / 3);
+  const requestJsonBytes = encodedRequestBodyBytes + 64 * 1024;
+  const encodedRequestFileBytes = 4 * Math.ceil(requestJsonBytes / 3);
+  const base64LineBreakBytes = 2 * Math.ceil(encodedRequestFileBytes / 76) + 2;
+  return encodedRequestFileBytes + base64LineBreakBytes;
+}
+
+function adapterExecutionTargetCommandRunner(
+  target: AdapterCommandCapableExecutionTarget,
+  maxBufferBytes: number,
+): CommandManagedRuntimeRunner {
   if (target.transport === "ssh") {
     return createSshCommandManagedRuntimeRunner({
       spec: target.spec,
       defaultCwd: target.remoteCwd,
-      maxBufferBytes: DEFAULT_SANDBOX_CALLBACK_BRIDGE_MAX_BODY_BYTES * 4,
+      maxBufferBytes,
     });
   }
   return requireSandboxRunner(target);
@@ -1670,7 +1687,10 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
     process.env.PAPERCLIP_API_URL?.trim() ||
     resolveDefaultPaperclipApiUrl();
   const shellCommand = adapterExecutionTargetShellCommand(target);
-  const runner = adapterExecutionTargetCommandRunner(target);
+  const runner = adapterExecutionTargetCommandRunner(
+    target,
+    sandboxCallbackBridgeSshMaxBufferBytes(maxBodyBytes, maxAttachmentBodyBytes),
+  );
   const bridgeTimeoutMs =
     typeof input.timeoutSec === "number" && Number.isFinite(input.timeoutSec) && input.timeoutSec > 0
       ? Math.trunc(input.timeoutSec * 1000)
