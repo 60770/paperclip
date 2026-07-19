@@ -7166,6 +7166,43 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     if (!resumeRun) return null;
 
     const resumeContext = parseObject(resumeRun.contextSnapshot);
+    const resumeIssueId = readNonEmptyString(resumeContext.issueId);
+    const resumeSourceWorkspace = resumeIssueId
+      ? await db
+          .select({
+            id: executionWorkspaces.id,
+            cwd: executionWorkspaces.cwd,
+            providerRef: executionWorkspaces.providerRef,
+            projectId: executionWorkspaces.projectId,
+            projectWorkspaceId: executionWorkspaces.projectWorkspaceId,
+            sourceIssueId: executionWorkspaces.sourceIssueId,
+            mode: executionWorkspaces.mode,
+            strategyType: executionWorkspaces.strategyType,
+            repoUrl: executionWorkspaces.repoUrl,
+            baseRef: executionWorkspaces.baseRef,
+            metadata: executionWorkspaces.metadata,
+          })
+          .from(issues)
+          .innerJoin(executionWorkspaces, eq(executionWorkspaces.id, issues.executionWorkspaceId))
+          .where(and(
+            eq(issues.id, resumeIssueId),
+            eq(issues.companyId, agent.companyId),
+            eq(executionWorkspaces.companyId, agent.companyId),
+          ))
+          .then((rows) => rows[0] ?? null)
+      : null;
+    const resumeSourceWorkspaceMetadata = parseObject(resumeSourceWorkspace?.metadata);
+    const resumeSourceWorkspaceCwd =
+      readNonEmptyString(resumeSourceWorkspace?.cwd) ?? readNonEmptyString(resumeSourceWorkspace?.providerRef);
+    const verifiedResumeSourceWorkspace =
+      resumeSourceWorkspace &&
+      resumeSourceWorkspace.sourceIssueId === resumeIssueId &&
+      resumeSourceWorkspace.mode === "isolated_workspace" &&
+      resumeSourceWorkspace.strategyType === "git_worktree" &&
+      readNonEmptyString(resumeSourceWorkspaceMetadata.source) === "task_session" &&
+      resumeSourceWorkspaceCwd
+        ? resumeSourceWorkspace
+        : null;
     const resumeTaskKey = deriveTaskKey(resumeContext, null) ?? taskKey;
     const resumeTaskSession = resumeTaskKey
       ? await getTaskSession(agent.companyId, agent.id, agent.adapterType, resumeTaskKey)
@@ -7186,13 +7223,25 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     });
     if (!sessionOverride) return null;
 
+    const sessionParams = verifiedResumeSourceWorkspace && resumeSourceWorkspaceCwd
+      ? {
+          ...sessionOverride.sessionParams,
+          cwd: resumeSourceWorkspaceCwd,
+          workspaceId: verifiedResumeSourceWorkspace.projectWorkspaceId,
+          repoUrl: verifiedResumeSourceWorkspace.repoUrl,
+          repoRef: verifiedResumeSourceWorkspace.baseRef,
+        }
+      : sessionOverride.sessionParams;
+
     return {
       resumeFromRunId,
       taskKey: resumeTaskKey,
-      issueId: readNonEmptyString(resumeContext.issueId),
+      issueId: resumeIssueId,
       taskId: readNonEmptyString(resumeContext.taskId) ?? readNonEmptyString(resumeContext.issueId),
       sessionDisplayId: sessionOverride.sessionDisplayId,
-      sessionParams: sessionOverride.sessionParams,
+      sessionParams,
+      sourceExecutionWorkspaceId: verifiedResumeSourceWorkspace?.id ?? null,
+      sourceExecutionWorkspaceProjectId: verifiedResumeSourceWorkspace?.projectId ?? null,
     };
   }
 
@@ -11928,8 +11977,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       issueSettings: issueExecutionWorkspaceSettings,
       legacyUseProjectWorkspace: issueAssigneeOverrides?.useProjectWorkspace ?? null,
     });
+    const isManagedBlockedTaskSessionAttestation =
+      context.dependencyBlockedTaskSessionAttestation === true &&
+      context.dependencyBlockedInteraction === true &&
+      Boolean(readNonEmptyString(context.resumeSourceExecutionWorkspaceId));
     const requestedExecutionWorkspaceMode =
-      trustPreset.kind === "low_trust_review" && resolvedExecutionWorkspaceMode === "shared_workspace"
+      isManagedBlockedTaskSessionAttestation
+        ? "isolated_workspace"
+        : trustPreset.kind === "low_trust_review" && resolvedExecutionWorkspaceMode === "shared_workspace"
         ? "isolated_workspace"
         : resolvedExecutionWorkspaceMode;
     const issueRef = issueContext
@@ -12562,6 +12617,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               projectId: resolvedProjectId,
               projectWorkspaceId: resolvedProjectWorkspaceId,
               sourceIssueId: issueRef?.id ?? null,
+              derivedFromExecutionWorkspaceId:
+                readNonEmptyString(context.resumeSourceExecutionWorkspaceId) ?? null,
               mode:
                 requestedExecutionWorkspaceMode === "isolated_workspace"
                   ? "isolated_workspace"
@@ -15139,6 +15196,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       enrichedContextSnapshot.resumeFromRunId = explicitResumeSession.resumeFromRunId;
       enrichedContextSnapshot.resumeSessionDisplayId = explicitResumeSession.sessionDisplayId;
       enrichedContextSnapshot.resumeSessionParams = explicitResumeSession.sessionParams;
+      if (explicitResumeSession.sourceExecutionWorkspaceId) {
+        enrichedContextSnapshot.resumeSourceExecutionWorkspaceId = explicitResumeSession.sourceExecutionWorkspaceId;
+      }
       if (!readNonEmptyString(enrichedContextSnapshot.issueId) && explicitResumeSession.issueId) {
         enrichedContextSnapshot.issueId = explicitResumeSession.issueId;
       }
@@ -15644,6 +15704,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           explicitResumeSession !== null &&
           readNonEmptyString(payload?.issueId) === issue.id &&
           readNonEmptyString(payload?.resumeFromRunId) === explicitResumeSession.resumeFromRunId &&
+          (
+            issue.projectId === null ||
+            (
+              explicitResumeSession.sourceExecutionWorkspaceId !== null &&
+              explicitResumeSession.sourceExecutionWorkspaceProjectId === issue.projectId
+            )
+          ) &&
           typeof opts.idempotencyKey === "string" &&
           opts.idempotencyKey.trim().length > 0 &&
           enrichedContextSnapshot.forceFreshSession !== true &&

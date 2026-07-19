@@ -22,6 +22,8 @@ import {
   issueRelations,
   issueTreeHolds,
   issues,
+  projects,
+  projectWorkspaces,
   workspaceOperations,
 } from "@paperclipai/db";
 import {
@@ -148,6 +150,8 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
     await db.delete(environments);
     await db.delete(workspaceOperations);
     await db.delete(executionWorkspaces);
+    await db.delete(projectWorkspaces);
+    await db.delete(projects);
     await db.delete(environmentLeases);
     for (let attempt = 0; attempt < 5; attempt += 1) {
       try {
@@ -1117,6 +1121,219 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
       .where(eq(agentWakeupRequests.reason, "managed_blocked_task_session_resume_denied"))
       .then((rows) => rows[0]?.count ?? 0);
     expect(deniedWakeCount).toBe(4);
+  });
+
+  it("binds a project-scoped managed resume to the verified task-session workspace", async () => {
+    const companyId = randomUUID();
+    const managerAgentId = randomUUID();
+    const targetAgentId = randomUUID();
+    const projectId = randomUUID();
+    const projectWorkspaceId = randomUUID();
+    const sourceIssueId = randomUUID();
+    const targetIssueId = randomUUID();
+    const blockerIssueId = randomUUID();
+    const sourceExecutionWorkspaceId = randomUUID();
+    const sourceRunId = randomUUID();
+    const capacityRunId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+    await db.insert(agents).values([
+      {
+        id: managerAgentId,
+        companyId,
+        name: "Engineering Manager",
+        role: "cto",
+        status: "idle",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+      {
+        id: targetAgentId,
+        companyId,
+        name: "Security Reviewer",
+        role: "security",
+        reportsTo: managerAgentId,
+        status: "idle",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {
+          heartbeat: {
+            wakeOnDemand: true,
+            maxConcurrentRuns: 1,
+          },
+        },
+        permissions: {},
+      },
+    ]);
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Customer project",
+      status: "in_progress",
+      executionWorkspacePolicy: {
+        enabled: true,
+        defaultMode: "isolated_workspace",
+        allowIssueOverride: true,
+        workspaceStrategy: { type: "git_worktree" },
+      },
+    });
+    await db.insert(projectWorkspaces).values({
+      id: projectWorkspaceId,
+      companyId,
+      projectId,
+      name: "Primary workspace",
+      sourceType: "local_path",
+      cwd: process.cwd(),
+      isPrimary: true,
+    });
+    await db.insert(issues).values([
+      {
+        id: sourceIssueId,
+        companyId,
+        projectId,
+        projectWorkspaceId,
+        title: "Source task session",
+        status: "blocked",
+        priority: "high",
+        responsibleUserId: "responsible-user",
+      },
+      {
+        id: blockerIssueId,
+        companyId,
+        projectId,
+        projectWorkspaceId,
+        title: "Security gate",
+        status: "todo",
+        priority: "high",
+        responsibleUserId: "responsible-user",
+      },
+      {
+        id: targetIssueId,
+        companyId,
+        projectId,
+        projectWorkspaceId,
+        title: "Attest inherited workspace",
+        status: "blocked",
+        priority: "high",
+        assigneeAgentId: targetAgentId,
+        assigneeAdapterOverrides: { useProjectWorkspace: false },
+        executionWorkspaceSettings: { mode: "agent_default" },
+        responsibleUserId: "responsible-user",
+      },
+    ]);
+    await db.insert(executionWorkspaces).values({
+      id: sourceExecutionWorkspaceId,
+      companyId,
+      projectId,
+      projectWorkspaceId,
+      sourceIssueId,
+      mode: "isolated_workspace",
+      strategyType: "git_worktree",
+      name: "source-task-session",
+      status: "idle",
+      cwd: process.cwd(),
+      repoUrl: "https://example.invalid/customer.git",
+      baseRef: "main",
+      branchName: "source-task-session",
+      providerType: "git_worktree",
+      providerRef: process.cwd(),
+      metadata: { source: "task_session" },
+    });
+    await db
+      .update(issues)
+      .set({
+        executionWorkspaceId: sourceExecutionWorkspaceId,
+        executionWorkspacePreference: "reuse_existing",
+        executionWorkspaceSettings: { mode: "isolated_workspace" },
+      })
+      .where(eq(issues.id, sourceIssueId));
+    await db.insert(issueRelations).values({
+      companyId,
+      issueId: blockerIssueId,
+      relatedIssueId: targetIssueId,
+      type: "blocks",
+    });
+    await db.insert(heartbeatRuns).values([
+      {
+        id: sourceRunId,
+        companyId,
+        agentId: targetAgentId,
+        invocationSource: "on_demand",
+        triggerDetail: "manual",
+        status: "succeeded",
+        responsibleUserId: "responsible-user",
+        sessionIdAfter: "0196f4e2-4bbc-7ac0-a3d9-3235255d3b3e",
+        contextSnapshot: {
+          issueId: sourceIssueId,
+          taskId: sourceIssueId,
+          taskKey: sourceIssueId,
+        },
+        startedAt: new Date(Date.now() - 2_000),
+        finishedAt: new Date(Date.now() - 1_000),
+      },
+      {
+        id: capacityRunId,
+        companyId,
+        agentId: targetAgentId,
+        invocationSource: "automation",
+        triggerDetail: "system",
+        status: "running",
+        responsibleUserId: "responsible-user",
+        contextSnapshot: { wakeReason: "capacity_holder" },
+        startedAt: new Date(),
+      },
+    ]);
+
+    const queuedRun = await heartbeat.wakeup(targetAgentId, {
+      source: "on_demand",
+      triggerDetail: "manual",
+      reason: "security_task_session_resume",
+      payload: { issueId: targetIssueId, resumeFromRunId: sourceRunId },
+      idempotencyKey: `blocked-task-session:${randomUUID()}`,
+      requestedByActorType: "agent",
+      requestedByActorId: managerAgentId,
+      contextSnapshot: {
+        triggeredBy: "agent",
+        actorId: managerAgentId,
+        managedBlockedTaskSessionResume: true,
+      },
+    });
+
+    expect(queuedRun).not.toBeNull();
+    const persistedRun = await db
+      .select({ status: heartbeatRuns.status, contextSnapshot: heartbeatRuns.contextSnapshot })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, queuedRun!.id))
+      .then((rows) => rows[0] ?? null);
+    expect(persistedRun).toMatchObject({
+      status: "queued",
+      contextSnapshot: {
+        issueId: targetIssueId,
+        resumeFromRunId: sourceRunId,
+        resumeSourceExecutionWorkspaceId: sourceExecutionWorkspaceId,
+        resumeSessionParams: {
+          cwd: process.cwd(),
+          workspaceId: projectWorkspaceId,
+          repoUrl: "https://example.invalid/customer.git",
+          repoRef: "main",
+        },
+        dependencyBlockedInteraction: true,
+        dependencyBlockedTaskSessionAttestation: true,
+      },
+    });
+
+    await db
+      .update(heartbeatRuns)
+      .set({ status: "succeeded", finishedAt: new Date(), updatedAt: new Date() })
+      .where(sql`${heartbeatRuns.id} in (${capacityRunId}, ${queuedRun!.id})`);
   });
 
   it("suppresses normal wakeups while allowing comment interaction wakes under a pause hold", async () => {
