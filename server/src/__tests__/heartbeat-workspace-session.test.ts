@@ -26,6 +26,7 @@ import {
   parseSessionCompactionPolicy,
   provisionExecutionWorkspaceForFreshnessDecision,
   resolveExecutionWorkspaceConfigFreshness,
+  resolveExecutionWorkspacePersistenceIdentity,
   resolveExecutionWorkspaceReuseRequestForIssue,
   resolveExecutionWorkspaceReuseProvisioningPolicy,
   resolveNextSessionState,
@@ -1299,6 +1300,7 @@ describe("effective run execution workspace config freshness", () => {
     expect(decision.action).toBe("replace");
     expect(policy).toEqual({
       shouldRestoreExistingWorkspace: true,
+      shouldPersistAsDerivedWorkspace: false,
       shouldRefreshWorkspaceConfigSnapshot: false,
       shouldPersistLatestWorkspaceConfigMetadata: false,
     });
@@ -1332,6 +1334,67 @@ describe("effective run execution workspace config freshness", () => {
     expect(metadata?.configFingerprint).not.toMatchObject({
       workspaceHash: next.fingerprint,
     });
+  });
+
+  it("persists an SSH environment transition as a workspace derived from the SHA-bound source", async () => {
+    const base = buildWorkspaceConfigMetadata();
+    const next = buildWorkspaceConfigMetadata({
+      environment: {
+        selectedEnvironmentId: "environment-ssh",
+        driver: "ssh",
+        config: { provider: "ssh" },
+      },
+      realization: {
+        environmentDriver: "ssh",
+        environmentProvider: "ssh",
+      },
+    });
+    const decision = resolveExecutionWorkspaceConfigFreshness({
+      hasExistingWorkspace: true,
+      existingWorkspaceMetadata: persistedWorkspaceConfigFingerprint(base),
+      nextMetadata: next,
+    });
+    const sourceWorkspace = {
+      id: "workspace-sha-bound",
+      cwd: "/worktrees/source",
+      warnings: [],
+    };
+    const realizeWorkspace = vi.fn(async () => ({
+      id: "workspace-project-primary",
+      cwd: "/worktrees/main",
+      warnings: [],
+    }));
+
+    const provisioned = await provisionExecutionWorkspaceForFreshnessDecision({
+      requestedShouldReuseExisting: true,
+      existingExecutionWorkspaceId: sourceWorkspace.id,
+      issueRef: { id: "issue-target", identifier: "PAP-1977" },
+      runId: "run-ssh",
+      workspaceConfigFreshness: decision,
+      restoreExistingWorkspace: async () => sourceWorkspace,
+      realizeWorkspace,
+    });
+    const identity = resolveExecutionWorkspacePersistenceIdentity({
+      policy: provisioned.policy,
+      requestedExecutionWorkspaceId: sourceWorkspace.id,
+      resumeSourceExecutionWorkspaceId: null,
+    });
+
+    expect(decision.action).toBe("replace");
+    expect(decision.changedCategories).toEqual(expect.arrayContaining(["environment", "realization"]));
+    expect(provisioned.executionWorkspace).toBe(sourceWorkspace);
+    expect(provisioned.reusedExecutionWorkspace).toBeNull();
+    expect(provisioned.policy).toEqual({
+      shouldRestoreExistingWorkspace: true,
+      shouldPersistAsDerivedWorkspace: true,
+      shouldRefreshWorkspaceConfigSnapshot: false,
+      shouldPersistLatestWorkspaceConfigMetadata: true,
+    });
+    expect(identity).toEqual({
+      shouldUpdateExistingWorkspace: false,
+      derivedFromExecutionWorkspaceId: sourceWorkspace.id,
+    });
+    expect(realizeWorkspace).not.toHaveBeenCalled();
   });
 
   it("fails loudly when explicit reuse restore errors", async () => {

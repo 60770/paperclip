@@ -3207,6 +3207,7 @@ type WorkspaceConfigFreshnessOperationInput = {
 
 type ExecutionWorkspaceReuseProvisioningPolicy = {
   shouldRestoreExistingWorkspace: boolean;
+  shouldPersistAsDerivedWorkspace: boolean;
   shouldRefreshWorkspaceConfigSnapshot: boolean;
   shouldPersistLatestWorkspaceConfigMetadata: boolean;
 };
@@ -3249,14 +3250,42 @@ export function resolveExecutionWorkspaceReuseProvisioningPolicy(input: {
   const shouldRestoreExistingWorkspace = input.requestedShouldReuseExisting;
   const replacementClassDrift =
     input.requestedShouldReuseExisting && input.workspaceConfigFreshness.action === "replace";
+  const shouldPersistAsDerivedWorkspace =
+    replacementClassDrift &&
+    input.workspaceConfigFreshness.changedCategories.length > 0 &&
+    input.workspaceConfigFreshness.changedCategories.every(
+      (category) => category === "environment" || category === "realization",
+    );
 
   return {
     shouldRestoreExistingWorkspace,
+    shouldPersistAsDerivedWorkspace,
     shouldRefreshWorkspaceConfigSnapshot:
       shouldRestoreExistingWorkspace &&
       !replacementClassDrift &&
       input.workspaceConfigFreshness.shouldRefreshConfigSnapshot,
-    shouldPersistLatestWorkspaceConfigMetadata: !replacementClassDrift,
+    shouldPersistLatestWorkspaceConfigMetadata:
+      shouldPersistAsDerivedWorkspace || !replacementClassDrift,
+  };
+}
+
+export function resolveExecutionWorkspacePersistenceIdentity(input: {
+  policy: ExecutionWorkspaceReuseProvisioningPolicy;
+  requestedExecutionWorkspaceId: string | null | undefined;
+  resumeSourceExecutionWorkspaceId: string | null | undefined;
+}) {
+  const requestedExecutionWorkspaceId = readNonEmptyString(input.requestedExecutionWorkspaceId);
+  const resumeSourceExecutionWorkspaceId = readNonEmptyString(
+    input.resumeSourceExecutionWorkspaceId,
+  );
+  const shouldUpdateExistingWorkspace =
+    input.policy.shouldRestoreExistingWorkspace && !input.policy.shouldPersistAsDerivedWorkspace;
+
+  return {
+    shouldUpdateExistingWorkspace,
+    derivedFromExecutionWorkspaceId:
+      resumeSourceExecutionWorkspaceId ??
+      (input.policy.shouldPersistAsDerivedWorkspace ? requestedExecutionWorkspaceId : null),
   };
 }
 
@@ -3347,7 +3376,7 @@ export async function provisionExecutionWorkspaceForFreshnessDecision<T extends 
 
   return {
     executionWorkspace: restored,
-    reusedExecutionWorkspace: restored,
+    reusedExecutionWorkspace: policy.shouldPersistAsDerivedWorkspace ? null : restored,
     policy,
   };
 }
@@ -12591,7 +12620,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       source: executionWorkspace.source,
       createdByRuntime: executionWorkspace.created,
       configSnapshot,
-      shouldReuseExisting: resolvedWorkspaceReusePolicy.shouldRestoreExistingWorkspace,
+      shouldReuseExisting:
+        resolvedWorkspaceReusePolicy.shouldRestoreExistingWorkspace &&
+        !resolvedWorkspaceReusePolicy.shouldPersistAsDerivedWorkspace,
       shouldRefreshConfigSnapshot: resolvedWorkspaceReusePolicy.shouldRefreshWorkspaceConfigSnapshot,
       workspaceConfigMetadata: resolvedWorkspaceReusePolicy.shouldPersistLatestWorkspaceConfigMetadata
         ? latestWorkspaceConfigMetadata
@@ -12599,11 +12630,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       baseRef: executionWorkspace.repoRef,
       baseRefSha: executionWorkspace.baseRefSha ?? null,
     });
+    const workspacePersistenceIdentity = resolveExecutionWorkspacePersistenceIdentity({
+      policy: resolvedWorkspaceReusePolicy,
+      requestedExecutionWorkspaceId: workspaceReuseRequest.requestedExecutionWorkspaceId,
+      resumeSourceExecutionWorkspaceId: readNonEmptyString(context.resumeSourceExecutionWorkspaceId),
+    });
     const pendingForwardBranchReconcile = executionWorkspace.pendingForwardBranchReconcile ?? null;
     const branchNameForInitialPersistence =
       pendingForwardBranchReconcile?.recordedBranchName ?? executionWorkspace.branchName;
     try {
-      persistedExecutionWorkspace = resolvedWorkspaceReusePolicy.shouldRestoreExistingWorkspace && reusableExistingExecutionWorkspace
+      persistedExecutionWorkspace = workspacePersistenceIdentity.shouldUpdateExistingWorkspace && reusableExistingExecutionWorkspace
         ? await executionWorkspacesSvc.update(reusableExistingExecutionWorkspace.id, {
             cwd: executionWorkspace.cwd,
             repoUrl: executionWorkspace.repoUrl,
@@ -12622,7 +12658,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               projectWorkspaceId: resolvedProjectWorkspaceId,
               sourceIssueId: issueRef?.id ?? null,
               derivedFromExecutionWorkspaceId:
-                readNonEmptyString(context.resumeSourceExecutionWorkspaceId) ?? null,
+                workspacePersistenceIdentity.derivedFromExecutionWorkspaceId,
               mode:
                 requestedExecutionWorkspaceMode === "isolated_workspace"
                   ? "isolated_workspace"
