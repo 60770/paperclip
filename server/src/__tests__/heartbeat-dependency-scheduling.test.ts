@@ -5,6 +5,7 @@ import {
   activityLog,
   agents,
   agentRuntimeState,
+  agentTaskSessions,
   agentWakeupRequests,
   companySkills,
   companies,
@@ -138,6 +139,7 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
     await db.delete(issues);
     await db.delete(heartbeatRunEvents);
     await db.delete(activityLog);
+    await db.delete(agentTaskSessions);
     await db.delete(heartbeatRuns);
     await db.delete(agentWakeupRequests);
     await db.delete(agentRuntimeState);
@@ -882,6 +884,239 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
     });
     expect(readyRun?.status).toBe("succeeded");
     expect(mockAdapterExecute.mock.calls.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it("runs only an authorized manager-scoped task-session attestation on a blocked target", async () => {
+    const companyId = randomUUID();
+    const managerAgentId = randomUUID();
+    const targetAgentId = randomUUID();
+    const unrelatedAgentId = randomUUID();
+    const blockerId = randomUUID();
+    const allowedIssueId = randomUUID();
+    const wrongTargetIssueId = randomUUID();
+    const resumeRunId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+    await db.insert(agents).values([
+      {
+        id: managerAgentId,
+        companyId,
+        name: "Engineering Manager",
+        role: "cto",
+        status: "idle",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+      {
+        id: targetAgentId,
+        companyId,
+        name: "Security Reviewer",
+        role: "security",
+        reportsTo: managerAgentId,
+        status: "idle",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {
+          heartbeat: {
+            wakeOnDemand: true,
+            maxConcurrentRuns: 1,
+          },
+        },
+        permissions: {},
+      },
+      {
+        id: unrelatedAgentId,
+        companyId,
+        name: "Unrelated Agent",
+        role: "engineer",
+        status: "idle",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+    ]);
+    await db.insert(issues).values([
+      {
+        id: blockerId,
+        companyId,
+        title: "Security gate",
+        status: "todo",
+        priority: "high",
+        responsibleUserId: "responsible-user",
+      },
+      {
+        id: allowedIssueId,
+        companyId,
+        title: "Attest inherited workspace",
+        status: "blocked",
+        priority: "high",
+        assigneeAgentId: targetAgentId,
+        responsibleUserId: "responsible-user",
+      },
+      {
+        id: wrongTargetIssueId,
+        companyId,
+        title: "Different assignee",
+        status: "blocked",
+        priority: "high",
+        assigneeAgentId: unrelatedAgentId,
+        responsibleUserId: "responsible-user",
+      },
+    ]);
+    await db.insert(issueRelations).values([
+      {
+        companyId,
+        issueId: blockerId,
+        relatedIssueId: allowedIssueId,
+        type: "blocks",
+      },
+      {
+        companyId,
+        issueId: blockerId,
+        relatedIssueId: wrongTargetIssueId,
+        type: "blocks",
+      },
+    ]);
+    await db.insert(heartbeatRuns).values({
+      id: resumeRunId,
+      companyId,
+      agentId: targetAgentId,
+      invocationSource: "on_demand",
+      triggerDetail: "manual",
+      status: "succeeded",
+      responsibleUserId: "responsible-user",
+      sessionIdAfter: "0196f4e2-4bbc-7ac0-a3d9-3235255d3b3e",
+      contextSnapshot: {
+        issueId: blockerId,
+        taskId: blockerId,
+        taskKey: blockerId,
+      },
+      startedAt: new Date(Date.now() - 2_000),
+      finishedAt: new Date(Date.now() - 1_000),
+    });
+
+    const authorizedRun = await heartbeat.wakeup(targetAgentId, {
+      source: "on_demand",
+      triggerDetail: "manual",
+      reason: "security_task_session_resume",
+      payload: {
+        issueId: allowedIssueId,
+        resumeFromRunId: resumeRunId,
+      },
+      idempotencyKey: `blocked-task-session:${randomUUID()}`,
+      requestedByActorType: "agent",
+      requestedByActorId: managerAgentId,
+      contextSnapshot: {
+        triggeredBy: "agent",
+        actorId: managerAgentId,
+        managedBlockedTaskSessionResume: true,
+      },
+    });
+
+    expect(authorizedRun).not.toBeNull();
+    await waitForCondition(async () => {
+      const run = await db
+        .select({ status: heartbeatRuns.status })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, authorizedRun!.id))
+        .then((rows) => rows[0] ?? null);
+      return run?.status === "succeeded";
+    });
+
+    const [persistedRun, persistedIssue] = await Promise.all([
+      db
+        .select({
+          status: heartbeatRuns.status,
+          contextSnapshot: heartbeatRuns.contextSnapshot,
+        })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, authorizedRun!.id))
+        .then((rows) => rows[0] ?? null),
+      db
+        .select({
+          status: issues.status,
+          assigneeAgentId: issues.assigneeAgentId,
+        })
+        .from(issues)
+        .where(eq(issues.id, allowedIssueId))
+        .then((rows) => rows[0] ?? null),
+    ]);
+
+    expect(persistedRun).toMatchObject({
+      status: "succeeded",
+      contextSnapshot: {
+        issueId: allowedIssueId,
+        resumeFromRunId: resumeRunId,
+        managedBlockedTaskSessionResume: true,
+        dependencyBlockedInteraction: true,
+        dependencyBlockedTaskSessionAttestation: true,
+        unresolvedBlockerIssueIds: [blockerId],
+      },
+    });
+    expect(persistedIssue).toEqual({
+      status: "blocked",
+      assigneeAgentId: targetAgentId,
+    });
+
+    const deniedRequests = [
+      heartbeat.wakeup(targetAgentId, {
+        source: "on_demand",
+        triggerDetail: "manual",
+        reason: "security_task_session_resume",
+        payload: { issueId: allowedIssueId, resumeFromRunId: resumeRunId },
+        idempotencyKey: `blocked-task-session:${randomUUID()}`,
+        requestedByActorType: "agent",
+        requestedByActorId: unrelatedAgentId,
+        contextSnapshot: { managedBlockedTaskSessionResume: true },
+      }),
+      heartbeat.wakeup(targetAgentId, {
+        source: "on_demand",
+        triggerDetail: "manual",
+        reason: "security_task_session_resume",
+        payload: { issueId: wrongTargetIssueId, resumeFromRunId: resumeRunId },
+        idempotencyKey: `blocked-task-session:${randomUUID()}`,
+        requestedByActorType: "agent",
+        requestedByActorId: managerAgentId,
+        contextSnapshot: { managedBlockedTaskSessionResume: true },
+      }),
+      heartbeat.wakeup(targetAgentId, {
+        source: "assignment",
+        triggerDetail: "system",
+        reason: "issue_assigned",
+        payload: { issueId: allowedIssueId, resumeFromRunId: resumeRunId },
+        idempotencyKey: `blocked-task-session:${randomUUID()}`,
+        requestedByActorType: "agent",
+        requestedByActorId: managerAgentId,
+        contextSnapshot: { managedBlockedTaskSessionResume: true },
+      }),
+      heartbeat.wakeup(targetAgentId, {
+        source: "on_demand",
+        triggerDetail: "manual",
+        reason: "security_task_session_resume",
+        payload: { issueId: allowedIssueId },
+        idempotencyKey: `blocked-task-session:${randomUUID()}`,
+        requestedByActorType: "agent",
+        requestedByActorId: managerAgentId,
+        contextSnapshot: { managedBlockedTaskSessionResume: true },
+      }),
+    ];
+
+    await expect(Promise.all(deniedRequests)).resolves.toEqual([null, null, null, null]);
+    const deniedWakeCount = await db
+      .select({ count: sql<number>`count(*)::int` })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.reason, "managed_blocked_task_session_resume_denied"))
+      .then((rows) => rows[0]?.count ?? 0);
+    expect(deniedWakeCount).toBe(4);
   });
 
   it("suppresses normal wakeups while allowing comment interaction wakes under a pause hold", async () => {

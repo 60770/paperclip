@@ -10642,7 +10642,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const dependencyReadiness = await issuesSvc.listDependencyReadiness(run.companyId, [issueId]);
       const readiness = dependencyReadiness.get(issueId);
       const unresolvedBlockerCount = readiness?.unresolvedBlockerCount ?? 0;
-      if (unresolvedBlockerCount > 0 && !allowsIssueInteractionWake(context)) {
+      const isBlockedTaskSessionAttestation =
+        context.dependencyBlockedTaskSessionAttestation === true &&
+        context.dependencyBlockedInteraction === true;
+      if (
+        unresolvedBlockerCount > 0 &&
+        !allowsIssueInteractionWake(context) &&
+        !isBlockedTaskSessionAttestation
+      ) {
         await cancelQueuedRunForBlockedDependencies(run, issueId, readiness?.unresolvedBlockerIssueIds ?? []);
         logger.info({ runId: run.id, issueId, unresolvedBlockerCount }, "claimQueuedRun: cancelled blocked queued run");
         return null;
@@ -10829,7 +10836,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
 
     const wakeCommentId = deriveCommentId(context, null);
-    const isInteractionWake = allowsIssueInteractionWake(context);
+    const isInteractionWake =
+      allowsIssueInteractionWake(context) ||
+      (
+        context.dependencyBlockedTaskSessionAttestation === true &&
+        context.dependencyBlockedInteraction === true
+      );
     const resumeIntent = context.resumeIntent === true || context.followUpRequested === true;
     const wakeReason = readNonEmptyString(context.wakeReason);
     const retryReason = readNonEmptyString(context.retryReason) ?? run.scheduledRetryReason ?? null;
@@ -15619,16 +15631,60 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           tx,
         ).then((rows) => rows.get(issue.id) ?? null);
 
+        const managedBlockedTaskSessionResume =
+          enrichedContextSnapshot.managedBlockedTaskSessionResume === true;
+        const managedBlockedTaskSessionResumeAuthorized =
+          managedBlockedTaskSessionResume &&
+          source === "on_demand" &&
+          triggerDetail === "manual" &&
+          opts.requestedByActorType === "agent" &&
+          typeof opts.requestedByActorId === "string" &&
+          agent.reportsTo === opts.requestedByActorId &&
+          issue.assigneeAgentId === agent.id &&
+          explicitResumeSession !== null &&
+          readNonEmptyString(payload?.issueId) === issue.id &&
+          readNonEmptyString(payload?.resumeFromRunId) === explicitResumeSession.resumeFromRunId &&
+          typeof opts.idempotencyKey === "string" &&
+          opts.idempotencyKey.trim().length > 0 &&
+          enrichedContextSnapshot.forceFreshSession !== true &&
+          dependencyReadiness !== null &&
+          !dependencyReadiness.isDependencyReady;
+
+        if (managedBlockedTaskSessionResume && !managedBlockedTaskSessionResumeAuthorized) {
+          await tx.insert(agentWakeupRequests).values({
+            companyId: agent.companyId,
+            agentId,
+            source,
+            triggerDetail,
+            reason: "managed_blocked_task_session_resume_denied",
+            payload,
+            status: "skipped",
+            requestedByActorType: opts.requestedByActorType ?? null,
+            requestedByActorId: opts.requestedByActorId ?? null,
+            idempotencyKey: opts.idempotencyKey ?? null,
+            error: "Managed task-session resume failed its server-owned scope checks",
+            finishedAt: new Date(),
+          });
+          return { kind: "skipped" as const };
+        }
+
         // Blocked descendants should stay idle until the final blocker resolves.
         // Human comment/mention wakes are the exception: they may run in a
-        // bounded interaction mode so the assignee can answer or triage.
+        // bounded interaction mode so the assignee can answer or triage. A
+        // direct manager may also resume an existing task session solely to
+        // attest its issue-scoped workspace. That path is server-marked,
+        // assignment-bound, dependency-blocked, and cannot request a fresh
+        // session, so it does not weaken the dependency or checkout gates.
         const blockedInteractionWake =
           dependencyReadiness &&
           !dependencyReadiness.isDependencyReady &&
-          allowsIssueInteractionWake(enrichedContextSnapshot);
+          (allowsIssueInteractionWake(enrichedContextSnapshot) || managedBlockedTaskSessionResumeAuthorized);
 
         if (blockedInteractionWake) {
           enrichedContextSnapshot.dependencyBlockedInteraction = true;
+          if (managedBlockedTaskSessionResumeAuthorized) {
+            enrichedContextSnapshot.dependencyBlockedTaskSessionAttestation = true;
+          }
           enrichedContextSnapshot.unresolvedBlockerIssueIds = dependencyReadiness.unresolvedBlockerIssueIds;
           enrichedContextSnapshot.unresolvedBlockerCount = dependencyReadiness.unresolvedBlockerCount;
           enrichedContextSnapshot.unresolvedBlockerSummaries = await listUnresolvedBlockerSummaries(

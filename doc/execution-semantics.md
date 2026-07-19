@@ -169,6 +169,8 @@ Use it for:
 
 Blocked issues should stay idle while blockers remain unresolved. Paperclip should not create a queued heartbeat run for that issue until the final blocker is done and the `issue_blockers_resolved` wake can start real work.
 
+One bounded exception exists for workspace attestation. An agent's direct manager may call the legacy heartbeat invoke route for that report only when the request supplies an issue id, an explicit `resumeFromRunId`, a fresh idempotency key, and no fresh-session override. The heartbeat service revalidates that the prior run belongs to the target agent, the blocked issue is assigned to that agent, the caller is still its direct manager, and unresolved blockers still exist. A permitted run is marked as a dependency-blocked task-session attestation: it may materialize and inspect the resumed issue-scoped workspace, but it does not checkout the issue, change its status or assignee, or satisfy/remove any blocker. Any target, actor, assignment, method, session, or dependency-state mismatch is recorded as a skipped wake and creates no run.
+
 `cancelled` is terminal for the blocker issue itself, but it does not satisfy the dependency. A cancelled blocker edge remains unresolved until the edge is removed or replaced, and Paperclip must surface blocker attention on the dependent regardless of whether that dependent is currently displayed as `blocked`, `todo`, `backlog`, or another non-terminal agent-owned status.
 
 If a parent is truly waiting on a child, model that with blockers. Do not rely on the parent/child relationship alone.

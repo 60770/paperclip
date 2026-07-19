@@ -84,7 +84,16 @@ function registerModuleMocks() {
   }));
 }
 
-async function createApp(db: Record<string, unknown> = {}) {
+async function createApp(
+  db: Record<string, unknown> = {},
+  actor: Record<string, unknown> = {
+    type: "board",
+    userId: "local-board",
+    companyIds: ["company-1"],
+    source: "local_implicit",
+    isInstanceAdmin: false,
+  },
+) {
   const [{ agentRoutes }, { errorHandler }] = await Promise.all([
     vi.importActual<typeof import("../routes/agents.js")>("../routes/agents.js"),
     vi.importActual<typeof import("../middleware/index.js")>("../middleware/index.js"),
@@ -92,13 +101,7 @@ async function createApp(db: Record<string, unknown> = {}) {
   const app = express();
   app.use(express.json());
   app.use((req, _res, next) => {
-    (req as any).actor = {
-      type: "board",
-      userId: "local-board",
-      companyIds: ["company-1"],
-      source: "local_implicit",
-      isInstanceAdmin: false,
-    };
+    (req as any).actor = actor;
     next();
   });
   app.use("/api", agentRoutes(db as any));
@@ -622,6 +625,116 @@ describe("agent live run routes", () => {
         forceFreshSession: true,
       },
     });
+  });
+
+  it("lets a direct manager request a bounded blocked task-session resume", async () => {
+    const managerAgentId = "22222222-2222-4222-8222-222222222222";
+    mockAgentService.getById.mockResolvedValue({
+      id: routeAgentId,
+      companyId: "company-1",
+      name: "Security Reviewer",
+      reportsTo: managerAgentId,
+      adapterType: "codex_local",
+    });
+
+    const res = await requestApp(
+      await createApp({}, {
+        type: "agent",
+        agentId: managerAgentId,
+        companyId: "company-1",
+        companyIds: ["company-1"],
+        source: "agent_api_key",
+      }),
+      (baseUrl) => request(baseUrl)
+        .post(`/api/agents/${routeAgentId}/heartbeat/invoke?companyId=company-1`)
+        .send({
+          reason: "security_task_session_resume",
+          payload: {
+            issueId: "33333333-3333-4333-8333-333333333333",
+            resumeFromRunId: "44444444-4444-4444-8444-444444444444",
+          },
+          idempotencyKey: "resume:security:1",
+        }),
+    );
+
+    expect(res.status, JSON.stringify(res.body)).toBe(202);
+    expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(routeAgentId, {
+      source: "on_demand",
+      triggerDetail: "manual",
+      reason: "security_task_session_resume",
+      payload: {
+        issueId: "33333333-3333-4333-8333-333333333333",
+        resumeFromRunId: "44444444-4444-4444-8444-444444444444",
+      },
+      idempotencyKey: "resume:security:1",
+      requestedByActorType: "agent",
+      requestedByActorId: managerAgentId,
+      contextSnapshot: {
+        triggeredBy: "agent",
+        actorId: managerAgentId,
+        managedBlockedTaskSessionResume: true,
+      },
+    });
+  });
+
+  it.each([
+    {
+      label: "caller is not the direct manager",
+      reportsTo: "55555555-5555-4555-8555-555555555555",
+      body: {
+        reason: "security_task_session_resume",
+        payload: {
+          issueId: "33333333-3333-4333-8333-333333333333",
+          resumeFromRunId: "44444444-4444-4444-8444-444444444444",
+        },
+        idempotencyKey: "resume:security:2",
+      },
+    },
+    {
+      label: "explicit resume method is missing",
+      reportsTo: "22222222-2222-4222-8222-222222222222",
+      body: {
+        reason: "security_task_session_resume",
+        payload: { issueId: "33333333-3333-4333-8333-333333333333" },
+        idempotencyKey: "resume:security:3",
+      },
+    },
+    {
+      label: "idempotency key is missing",
+      reportsTo: "22222222-2222-4222-8222-222222222222",
+      body: {
+        reason: "security_task_session_resume",
+        payload: {
+          issueId: "33333333-3333-4333-8333-333333333333",
+          resumeFromRunId: "44444444-4444-4444-8444-444444444444",
+        },
+      },
+    },
+  ])("keeps managed invoke fail-closed when $label", async ({ reportsTo, body }) => {
+    const managerAgentId = "22222222-2222-4222-8222-222222222222";
+    mockAgentService.getById.mockResolvedValue({
+      id: routeAgentId,
+      companyId: "company-1",
+      name: "Security Reviewer",
+      reportsTo,
+      adapterType: "codex_local",
+    });
+
+    const res = await requestApp(
+      await createApp({}, {
+        type: "agent",
+        agentId: managerAgentId,
+        companyId: "company-1",
+        companyIds: ["company-1"],
+        source: "agent_api_key",
+      }),
+      (baseUrl) => request(baseUrl)
+        .post(`/api/agents/${routeAgentId}/heartbeat/invoke?companyId=company-1`)
+        .send(body),
+    );
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
   });
 
   it("calls heartbeat.wakeup with the legacy minimal shape when the body is empty", async () => {

@@ -3476,8 +3476,30 @@ export function agentRoutes(
     const agent = await getAccessibleResource(req, res, svc.getById(id), "Agent not found");
     if (!agent) return;
 
+    const body = (req.body ?? {}) as Partial<{
+      reason: unknown;
+      payload: unknown;
+      idempotencyKey: unknown;
+      forceFreshSession: unknown;
+      triggerDetail: unknown;
+    }>;
+    const payload = body.payload && typeof body.payload === "object" && !Array.isArray(body.payload)
+      ? body.payload as Record<string, unknown>
+      : null;
+    const isExplicitTaskSessionResume =
+      typeof payload?.issueId === "string" && payload.issueId.trim().length > 0 &&
+      typeof payload?.resumeFromRunId === "string" && payload.resumeFromRunId.trim().length > 0 &&
+      typeof body.idempotencyKey === "string" && body.idempotencyKey.trim().length > 0 &&
+      body.forceFreshSession !== true &&
+      (body.triggerDetail === undefined || body.triggerDetail === "manual");
+    const isManagedBlockedTaskSessionResume =
+      req.actor.type === "agent" &&
+      req.actor.agentId !== id &&
+      agent.reportsTo === req.actor.agentId &&
+      isExplicitTaskSessionResume;
+
     if (req.actor.type === "agent") {
-      if (req.actor.agentId !== id) {
+      if (req.actor.agentId !== id && !isManagedBlockedTaskSessionResume) {
         res.status(403).json({ error: "Agent can only invoke itself" });
         return;
       }
@@ -3491,17 +3513,17 @@ export function agentRoutes(
       return;
     }
 
-    const body = (req.body ?? {}) as Partial<{
-      reason: unknown;
-      payload: unknown;
-      idempotencyKey: unknown;
-      forceFreshSession: unknown;
-      triggerDetail: unknown;
-    }>;
     const contextSnapshot: Record<string, unknown> = {
       triggeredBy: req.actor.type,
       actorId: req.actor.type === "agent" ? req.actor.agentId : req.actor.userId,
     };
+    if (isManagedBlockedTaskSessionResume) {
+      // This is only an authorization claim from the route. The heartbeat
+      // service revalidates the manager relationship, target assignment,
+      // explicit resume run, method, idempotency key, and dependency state in
+      // the issue transaction before it can create a run.
+      contextSnapshot.managedBlockedTaskSessionResume = true;
+    }
     if (body.forceFreshSession === true) {
       contextSnapshot.forceFreshSession = true;
     }
@@ -3515,8 +3537,8 @@ export function agentRoutes(
     if (typeof body.reason === "string" && body.reason.length > 0) {
       wakeOpts.reason = body.reason;
     }
-    if (body.payload && typeof body.payload === "object" && !Array.isArray(body.payload)) {
-      wakeOpts.payload = body.payload as Record<string, unknown>;
+    if (payload) {
+      wakeOpts.payload = payload;
     }
     if (typeof body.idempotencyKey === "string" && body.idempotencyKey.length > 0) {
       wakeOpts.idempotencyKey = body.idempotencyKey;
