@@ -1,4 +1,5 @@
 import { execFile as execFileCallback } from "node:child_process";
+import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -7,6 +8,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { prepareCommandManagedRuntime } from "./command-managed-runtime.js";
 import {
+  decodeSandboxCallbackBridgeRequestBody,
   authorizeSandboxCallbackBridgeRequestWithRoutes,
   createCommandManagedSandboxCallbackBridgeQueueClient,
   createFileSystemSandboxCallbackBridgeQueueClient,
@@ -100,6 +102,38 @@ describe("sandbox callback bridge", () => {
     }
     throw new Error(`Timed out waiting for a JSON file in ${directory}.`);
   }
+
+  function sha256Hex(input: Buffer): string {
+    return createHash("sha256").update(input).digest("hex");
+  }
+
+  it("decodes a 4 MiB base64 attachment body without stack overflow", () => {
+    const raw = Buffer.alloc(4 * 1024 * 1024, 0xab);
+    const encoded = raw.toString("base64");
+    const decoded = decodeSandboxCallbackBridgeRequestBody({
+      body: encoded,
+      bodyEncoding: "base64",
+    });
+    expect(decoded.byteLength).toBe(raw.byteLength);
+    expect(sha256Hex(decoded)).toBe(sha256Hex(raw));
+  });
+
+  it("decodes a near-cap base64 attachment body without stack overflow", () => {
+    const raw = Buffer.alloc(12 * 1024 * 1024 - 1024, 0xaa);
+    const encoded = raw.toString("base64");
+    const decoded = decodeSandboxCallbackBridgeRequestBody({
+      body: encoded,
+      bodyEncoding: "base64",
+    });
+    expect(decoded.byteLength).toBe(raw.byteLength);
+    expect(sha256Hex(decoded)).toBe(sha256Hex(raw));
+  });
+
+  it.each(["Zh==", "Zg=A", "Zg?"])("rejects non-canonical base64 attachment payload %s", (body) => {
+    expect(() => decodeSandboxCallbackBridgeRequestBody({ body, bodyEncoding: "base64" })).toThrow(
+      "Invalid base64 bridge request body.",
+    );
+  });
 
   afterEach(async () => {
     while (cleanupFns.length > 0) {
