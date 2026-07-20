@@ -1920,40 +1920,43 @@ export function executionWorkspaceService(db: Db) {
       const cutoff = new Date(now.getTime() - TERMINAL_SHARED_WORKSPACE_RETENTION_MS);
 
       return await db.transaction(async (tx) => {
+        const sourceIssue = alias(issues, "retention_source_issue");
         const linkedIssues = alias(issues, "retention_linked_issues");
+        const retentionConditions = [
+          eq(executionWorkspaces.mode, "shared_workspace"),
+          eq(executionWorkspaces.providerType, "local_fs"),
+          inArray(executionWorkspaces.status, ["active", "idle", "in_review"]),
+          isNull(executionWorkspaces.closedAt),
+          lt(executionWorkspaces.lastUsedAt, cutoff),
+          sql`exists (
+            select 1
+            from ${issues} as ${sql.raw("retention_source_issue")}
+            where ${and(
+              eq(sourceIssue.id, executionWorkspaces.sourceIssueId),
+              eq(sourceIssue.companyId, executionWorkspaces.companyId),
+              inArray(sourceIssue.status, ["done", "cancelled"]),
+            )}
+          )`,
+          sql`not exists (
+            select 1
+            from ${issues} as ${sql.raw("retention_linked_issues")}
+            where ${and(
+              eq(linkedIssues.companyId, executionWorkspaces.companyId),
+              eq(linkedIssues.executionWorkspaceId, executionWorkspaces.id),
+              sql`${linkedIssues.status} not in ('done', 'cancelled')`,
+            )}
+          )`,
+        ];
         const candidates = await tx
           .select({ id: executionWorkspaces.id })
           .from(executionWorkspaces)
-          .innerJoin(
-            issues,
-            and(
-              eq(issues.id, executionWorkspaces.sourceIssueId),
-              eq(issues.companyId, executionWorkspaces.companyId),
-            ),
-          )
-          .where(
-            and(
-              eq(executionWorkspaces.mode, "shared_workspace"),
-              eq(executionWorkspaces.providerType, "local_fs"),
-              inArray(executionWorkspaces.status, ["active", "idle", "in_review"]),
-              isNull(executionWorkspaces.closedAt),
-              lt(executionWorkspaces.lastUsedAt, cutoff),
-              inArray(issues.status, ["done", "cancelled"]),
-              sql`not exists (
-                select 1
-                from ${issues} as ${sql.raw("retention_linked_issues")}
-                where ${and(
-                  eq(linkedIssues.companyId, executionWorkspaces.companyId),
-                  eq(linkedIssues.executionWorkspaceId, executionWorkspaces.id),
-                  sql`${linkedIssues.status} not in ('done', 'cancelled')`,
-                )}
-              )`,
-            ),
-          );
+          .where(and(...retentionConditions))
+          .orderBy(asc(executionWorkspaces.id))
+          .for("update", { of: executionWorkspaces });
         const workspaceIds = candidates.map((candidate) => candidate.id);
         if (workspaceIds.length === 0) return { archived: 0 };
 
-        await tx
+        const archivedWorkspaces = await tx
           .update(executionWorkspaces)
           .set({
             status: "archived",
@@ -1961,7 +1964,13 @@ export function executionWorkspaceService(db: Db) {
             cleanupReason: "retention: terminal source issue",
             updatedAt: now,
           })
-          .where(inArray(executionWorkspaces.id, workspaceIds));
+          .where(and(
+            inArray(executionWorkspaces.id, workspaceIds),
+            ...retentionConditions,
+          ))
+          .returning({ id: executionWorkspaces.id });
+        const archivedWorkspaceIds = archivedWorkspaces.map((workspace) => workspace.id);
+        if (archivedWorkspaceIds.length === 0) return { archived: 0 };
 
         await tx
           .update(issues)
@@ -1970,11 +1979,11 @@ export function executionWorkspaceService(db: Db) {
             updatedAt: now,
           })
           .where(and(
-            inArray(issues.executionWorkspaceId, workspaceIds),
+            inArray(issues.executionWorkspaceId, archivedWorkspaceIds),
             inArray(issues.status, ["done", "cancelled"]),
           ));
 
-        return { archived: workspaceIds.length };
+        return { archived: archivedWorkspaceIds.length };
       });
     },
 

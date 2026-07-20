@@ -16,6 +16,7 @@ import {
   heartbeatRuns,
   issueComments,
   issueRecoveryActions,
+  instanceSettings,
   issues,
   projectWorkspaces,
   projects,
@@ -35,8 +36,19 @@ import {
   startRuntimeServicesForWorkspaceControl,
   stopRuntimeServicesForExecutionWorkspace,
 } from "../services/workspace-runtime.ts";
+import { instanceSettingsService } from "../services/instance-settings.ts";
+import { issueService } from "../services/issues.ts";
 
 const execFileAsync = promisify(execFile);
+
+async function waitForCondition(fn: () => Promise<boolean>, timeoutMs = 3_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await fn()) return true;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  return fn();
+}
 
 describe("execution workspace config helpers", () => {
   it("reads typed config from persisted metadata", () => {
@@ -219,6 +231,7 @@ async function fingerprintWorkspaceBranchIncoherenceForTest(input: {
 describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
   let db!: ReturnType<typeof createDb>;
   let svc!: ReturnType<typeof executionWorkspaceService>;
+  let issuesSvc!: ReturnType<typeof issueService>;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
   const tempDirs = new Set<string>();
 
@@ -226,6 +239,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-execution-workspaces-service-");
     db = createDb(tempDb.connectionString);
     svc = executionWorkspaceService(db);
+    issuesSvc = issueService(db);
   }, 20_000);
 
   afterEach(async () => {
@@ -239,6 +253,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     await db.delete(projects);
     await db.delete(heartbeatRuns);
     await db.delete(agents);
+    await db.delete(instanceSettings);
     await db.delete(companies);
 
     for (const dir of tempDirs) {
@@ -633,6 +648,116 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       { id: inheritedTerminalIssueId, executionWorkspaceId: inheritedWorkspaceId },
       { id: inheritedOpenIssueId, executionWorkspaceId: inheritedWorkspaceId },
     ]));
+  });
+
+  it("keeps a child created during a retention claim detached from the archived workspace", async () => {
+    const companyId = randomUUID();
+    const projectId = randomUUID();
+    const terminalIssueId = randomUUID();
+    const workspaceId = randomUUID();
+    const now = new Date("2026-07-20T12:00:00.000Z");
+    const lockKey = 2_043_001;
+    let releaseBarrier!: () => void;
+    let signalBarrierHeld!: () => void;
+    const releaseBarrierPromise = new Promise<void>((resolve) => {
+      releaseBarrier = resolve;
+    });
+    const barrierHeld = new Promise<void>((resolve) => {
+      signalBarrierHeld = resolve;
+    });
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: "PAP",
+      requireBoardApprovalForNewAgents: false,
+    });
+    await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: true });
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Workspace retention",
+      status: "in_progress",
+    });
+    await db.insert(issues).values({
+      id: terminalIssueId,
+      companyId,
+      projectId,
+      title: "Completed parent",
+      status: "done",
+      priority: "medium",
+    });
+    await db.insert(executionWorkspaces).values({
+      id: workspaceId,
+      companyId,
+      projectId,
+      sourceIssueId: terminalIssueId,
+      mode: "shared_workspace",
+      strategyType: "project_primary",
+      name: "Terminal shared",
+      status: "active",
+      providerType: "local_fs",
+      cwd: "/tmp/project-primary",
+      lastUsedAt: new Date(now.getTime() - TERMINAL_SHARED_WORKSPACE_RETENTION_MS - 1),
+    });
+    await db
+      .update(issues)
+      .set({ executionWorkspaceId: workspaceId })
+      .where(eq(issues.id, terminalIssueId));
+    await db.execute(sql.raw(`
+      CREATE FUNCTION "pause_execution_workspace_archive"()
+      RETURNS trigger
+      LANGUAGE plpgsql
+      AS $$
+      BEGIN
+        PERFORM pg_advisory_xact_lock(${lockKey});
+        RETURN NEW;
+      END;
+      $$;
+    `));
+    await db.execute(sql.raw(`
+      CREATE TRIGGER "pause_execution_workspace_archive"
+      BEFORE UPDATE OF "status" ON "execution_workspaces"
+      FOR EACH ROW
+      WHEN (NEW."status" = 'archived')
+      EXECUTE FUNCTION "pause_execution_workspace_archive"();
+    `));
+
+    const barrier = db.transaction(async (tx) => {
+      await tx.execute(sql`select pg_advisory_xact_lock(${lockKey})`);
+      signalBarrierHeld();
+      await releaseBarrierPromise;
+    });
+    await barrierHeld;
+    const archive = svc.archiveTerminalSharedLocalWorkspaces({ now });
+    const archiveIsWaiting = await waitForCondition(async () => {
+      const locks = await db.execute(sql<{ waiting: boolean }>`
+        select exists (
+          select 1
+          from pg_locks
+          where locktype = 'advisory'
+            and objid = ${lockKey}
+            and not granted
+        ) as waiting
+      `);
+      return locks[0]?.waiting === true;
+    });
+    expect(archiveIsWaiting).toBe(true);
+
+    const child = issuesSvc.create(companyId, {
+      parentId: terminalIssueId,
+      title: "Child created during retention",
+      status: "todo",
+      priority: "medium",
+    });
+
+    releaseBarrier();
+    await barrier;
+    await expect(archive).resolves.toEqual({ archived: 1 });
+    await expect(child).resolves.toMatchObject({ executionWorkspaceId: null });
+
+    await db.execute(sql.raw(`DROP TRIGGER "pause_execution_workspace_archive" ON "execution_workspaces"`));
+    await db.execute(sql.raw(`DROP FUNCTION "pause_execution_workspace_archive"()`));
   });
 
   it("limits reusable summaries to open non-shared execution workspaces", async () => {
