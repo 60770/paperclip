@@ -19,7 +19,6 @@ import {
   createSandboxCallbackBridgeAsset,
   createSandboxCallbackBridgeToken,
   decodeSandboxCallbackBridgeRequestBody,
-  DEFAULT_SANDBOX_CALLBACK_BRIDGE_MAX_ATTACHMENT_BODY_BYTES,
   DEFAULT_SANDBOX_CALLBACK_BRIDGE_MAX_BODY_BYTES,
   sandboxCallbackBridgeDirectories,
   startSandboxCallbackBridgeServer,
@@ -400,6 +399,30 @@ function sandboxCallbackBridgeSshMaxBufferBytes(
   const encodedRequestFileBytes = 4 * Math.ceil(requestJsonBytes / 3);
   const base64LineBreakBytes = 2 * Math.ceil(encodedRequestFileBytes / 76) + 2;
   return encodedRequestFileBytes + base64LineBreakBytes;
+}
+
+const DEFAULT_HOST_ATTACHMENT_MAX_BYTES = 10 * 1024 * 1024;
+const MULTIPART_ATTACHMENT_OVERHEAD_BYTES = 2 * 1024 * 1024;
+
+function resolveSandboxCallbackBridgeMaxAttachmentBodyBytes(
+  configuredMaxBodyBytes: number | null | undefined,
+): number {
+  if (
+    typeof configuredMaxBodyBytes === "number" &&
+    Number.isFinite(configuredMaxBodyBytes) &&
+    configuredMaxBodyBytes > 0
+  ) {
+    return Math.trunc(configuredMaxBodyBytes);
+  }
+
+  const configuredAttachmentMaxBytes = Number(process.env.PAPERCLIP_ATTACHMENT_MAX_BYTES);
+  const attachmentMaxBytes =
+    Number.isFinite(configuredAttachmentMaxBytes) && configuredAttachmentMaxBytes > 0
+      ? Math.trunc(configuredAttachmentMaxBytes)
+      : DEFAULT_HOST_ATTACHMENT_MAX_BYTES;
+
+  // The host limit applies to the file; the bridge reads its multipart envelope too.
+  return attachmentMaxBytes + MULTIPART_ATTACHMENT_OVERHEAD_BYTES;
 }
 
 function adapterExecutionTargetCommandRunner(
@@ -1675,12 +1698,9 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
     typeof input.maxBodyBytes === "number" && Number.isFinite(input.maxBodyBytes) && input.maxBodyBytes > 0
       ? Math.trunc(input.maxBodyBytes)
       : DEFAULT_SANDBOX_CALLBACK_BRIDGE_MAX_BODY_BYTES;
-  const maxAttachmentBodyBytes =
-    typeof input.maxAttachmentBodyBytes === "number" &&
-    Number.isFinite(input.maxAttachmentBodyBytes) &&
-    input.maxAttachmentBodyBytes > 0
-      ? Math.trunc(input.maxAttachmentBodyBytes)
-      : DEFAULT_SANDBOX_CALLBACK_BRIDGE_MAX_ATTACHMENT_BODY_BYTES;
+  const maxAttachmentBodyBytes = resolveSandboxCallbackBridgeMaxAttachmentBodyBytes(
+    input.maxAttachmentBodyBytes,
+  );
   const hostApiUrl =
     input.hostApiUrl?.trim() ||
     process.env.PAPERCLIP_RUNTIME_API_URL?.trim() ||

@@ -1077,7 +1077,7 @@ describe("sandbox adapter execution targets", () => {
     }
   });
 
-  it("forwards attachment payloads larger than the legacy SSH bridge buffer", async () => {
+  it("derives the attachment limit from the host cap and sizes the SSH bridge buffer", async () => {
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-execution-target-ssh-attachment-"));
     cleanupDirs.push(rootDir);
     const remoteCwd = path.join(rootDir, "workspace");
@@ -1085,12 +1085,19 @@ describe("sandbox adapter execution targets", () => {
     await mkdir(runtimeRootDir, { recursive: true });
 
     let configuredMaxBufferBytes = 0;
+    let configuredMaxAttachmentBodyBytes = 0;
     let largestStdoutBytes = 0;
     const localRunner = createLocalSandboxRunner();
+    vi.stubEnv("PAPERCLIP_ATTACHMENT_MAX_BYTES", String(20 * 1024 * 1024));
     vi.spyOn(ssh, "createSshCommandManagedRuntimeRunner").mockImplementation((input) => {
       configuredMaxBufferBytes = input.maxBufferBytes ?? 0;
       return {
         execute: async (commandInput) => {
+          if (commandInput.env?.PAPERCLIP_BRIDGE_MAX_ATTACHMENT_BODY_BYTES) {
+            configuredMaxAttachmentBodyBytes = Number(
+              commandInput.env.PAPERCLIP_BRIDGE_MAX_ATTACHMENT_BODY_BYTES,
+            );
+          }
           const result = await localRunner.execute(commandInput);
           const stdoutBytes = Buffer.byteLength(result.stdout, "utf8");
           largestStdoutBytes = Math.max(largestStdoutBytes, stdoutBytes);
@@ -1157,7 +1164,6 @@ describe("sandbox adapter execution targets", () => {
       adapterKey: "codex",
       hostApiToken: "real-run-jwt",
       hostApiUrl: `http://127.0.0.1:${address.port}`,
-      maxAttachmentBodyBytes: multipartBody.byteLength,
     });
     try {
       const response = await fetch(
@@ -1176,6 +1182,7 @@ describe("sandbox adapter execution targets", () => {
       await expect(response.json()).resolves.toEqual({ id: "attachment-ssh-1" });
       expect(receivedBody).toEqual(multipartBody);
       expect(largestStdoutBytes).toBeGreaterThan(1024 * 1024);
+      expect(configuredMaxAttachmentBodyBytes).toBe(22 * 1024 * 1024);
       expect(configuredMaxBufferBytes).toBeGreaterThanOrEqual(largestStdoutBytes);
     } finally {
       await bridge?.stop();
