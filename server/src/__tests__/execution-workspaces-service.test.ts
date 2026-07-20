@@ -568,7 +568,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
         mode: "shared_workspace",
         strategyType: "project_primary",
         name: "Inherited shared",
-        status: "idle",
+        status: "active",
         providerType: "local_fs",
         cwd: "/tmp/project-primary",
         lastUsedAt: staleLastUsedAt,
@@ -621,7 +621,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     expect(byId.get(openWorkspaceId)).toMatchObject({ status: "active", closedAt: null });
     expect(byId.get(recentWorkspaceId)).toMatchObject({ status: "active", closedAt: null });
     expect(byId.get(isolatedWorkspaceId)).toMatchObject({ status: "active", closedAt: null });
-    expect(byId.get(inheritedWorkspaceId)).toMatchObject({ status: "idle", closedAt: null });
+    expect(byId.get(inheritedWorkspaceId)).toMatchObject({ status: "active", closedAt: null });
 
     const linkedIssues = await db
       .select({ id: issues.id, executionWorkspaceId: issues.executionWorkspaceId })
