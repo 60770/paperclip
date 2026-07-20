@@ -41,6 +41,7 @@ import {
   backfillLegacyToolOAuthTokens,
   bootstrapExecutionPolicyFromEnv,
   environmentCustomImageService,
+  executionWorkspaceService,
   heartbeatService,
   instanceSettingsService,
   reconcileBuiltInAgentsOnStartup,
@@ -106,6 +107,8 @@ export interface StartedServer {
   apiUrl: string;
   databaseUrl: string;
 }
+
+const TERMINAL_SHARED_WORKSPACE_REAP_INTERVAL_MS = 6 * 60 * 60 * 1000;
 
 export async function startServer(): Promise<StartedServer> {
   // Tracing must be active (or have failed and logged) before the first DB
@@ -847,6 +850,7 @@ export async function startServer(): Promise<StartedServer> {
     drainHeartbeatRunsForShutdown = heartbeat.drainRunningRunsForShutdown;
     prepareHotRestartShutdown = heartbeat.prepareHotRestartShutdown;
     const environmentCustomImages = environmentCustomImageService(db as any, { pluginWorkerManager });
+    const executionWorkspaces = executionWorkspaceService(db as any);
     const routines = routineService(db as any, { pluginWorkerManager });
     const tools = toolAccessService(db as any, {
       deploymentMode: config.deploymentMode,
@@ -866,6 +870,12 @@ export async function startServer(): Promise<StartedServer> {
       "worktree run-execution cutoff state",
     );
     const heartbeatSchedulingSuppression = await heartbeat.resolveSchedulingSuppression();
+    const archiveTerminalSharedWorkspaces = async (trigger: "startup" | "scheduled") => {
+      const result = await executionWorkspaces.archiveTerminalSharedLocalWorkspaces();
+      if (result.archived > 0) {
+        logger.info({ ...result, trigger }, "archived retained shared execution workspaces");
+      }
+    };
 
     // Reap orphaned runs before timer ticks start so wakeups cannot coalesce
     // into a dead "running" row during startup recovery.
@@ -969,6 +979,7 @@ export async function startServer(): Promise<StartedServer> {
     if (setupCleanup.timedOut > 0 || setupCleanup.failed > 0) {
       logger.warn({ ...setupCleanup }, "startup environment customImage setup cleanup changed sessions");
     }
+    await archiveTerminalSharedWorkspaces("startup");
 
     const toolHealthSweep = await tools.sweepConnectionHealth();
     if (toolHealthSweep.failed > 0) {
@@ -1098,6 +1109,12 @@ export async function startServer(): Promise<StartedServer> {
         }
       })();
     }, config.heartbeatSchedulerIntervalMs);
+
+    setInterval(() => {
+      void archiveTerminalSharedWorkspaces("scheduled").catch((err) => {
+        logger.error({ err }, "shared execution workspace retention sweep failed");
+      });
+    }, TERMINAL_SHARED_WORKSPACE_REAP_INTERVAL_MS);
   }
   
   if (config.databaseBackupEnabled) {

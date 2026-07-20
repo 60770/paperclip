@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
-import { and, asc, desc, eq, inArray, isNull, ne, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNull, lt, ne, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { executionWorkspaces, heartbeatRuns, issueComments, issues, projects, projectWorkspaces, workspaceRuntimeServices } from "@paperclipai/db";
 import type {
@@ -44,6 +44,7 @@ type WorkspaceRuntimeServiceRow = typeof workspaceRuntimeServices.$inferSelect;
 type RuntimeServiceReadDb = Pick<Db, "select">;
 const execFileAsync = promisify(execFile);
 const TERMINAL_ISSUE_STATUSES = new Set(["done", "cancelled"]);
+export const TERMINAL_SHARED_WORKSPACE_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 const WORKSPACE_BRANCH_INCOHERENCE_REASON = "git_worktree_branch_incoherence";
 const WORKSPACE_VALIDATION_RECOVERY_CAUSE = "workspace_validation_failed";
 
@@ -1910,6 +1911,56 @@ export function executionWorkspaceService(db: Db) {
           restoredSourceIssue,
           sourceIssueStatusChanged,
         };
+      });
+    },
+
+    archiveTerminalSharedLocalWorkspaces: async (input: { now?: Date } = {}) => {
+      const now = input.now ?? new Date();
+      const cutoff = new Date(now.getTime() - TERMINAL_SHARED_WORKSPACE_RETENTION_MS);
+
+      return await db.transaction(async (tx) => {
+        const candidates = await tx
+          .select({ id: executionWorkspaces.id })
+          .from(executionWorkspaces)
+          .innerJoin(
+            issues,
+            and(
+              eq(issues.id, executionWorkspaces.sourceIssueId),
+              eq(issues.companyId, executionWorkspaces.companyId),
+            ),
+          )
+          .where(
+            and(
+              eq(executionWorkspaces.mode, "shared_workspace"),
+              eq(executionWorkspaces.providerType, "local_fs"),
+              inArray(executionWorkspaces.status, ["active", "idle", "in_review"]),
+              isNull(executionWorkspaces.closedAt),
+              lt(executionWorkspaces.lastUsedAt, cutoff),
+              inArray(issues.status, ["done", "cancelled"]),
+            ),
+          );
+        const workspaceIds = candidates.map((candidate) => candidate.id);
+        if (workspaceIds.length === 0) return { archived: 0 };
+
+        await tx
+          .update(executionWorkspaces)
+          .set({
+            status: "archived",
+            closedAt: now,
+            cleanupReason: "retention: terminal source issue",
+            updatedAt: now,
+          })
+          .where(inArray(executionWorkspaces.id, workspaceIds));
+
+        await tx
+          .update(issues)
+          .set({
+            executionWorkspaceId: null,
+            updatedAt: now,
+          })
+          .where(inArray(issues.executionWorkspaceId, workspaceIds));
+
+        return { archived: workspaceIds.length };
       });
     },
 
