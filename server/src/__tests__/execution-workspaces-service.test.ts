@@ -248,6 +248,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     await db.delete(issueRecoveryActions);
     await db.delete(issueComments);
     await db.delete(issues);
+    await db.delete(agents);
     await db.delete(executionWorkspaces);
     await db.delete(projectWorkspaces);
     await db.delete(projects);
@@ -648,6 +649,146 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       { id: inheritedTerminalIssueId, executionWorkspaceId: inheritedWorkspaceId },
       { id: inheritedOpenIssueId, executionWorkspaceId: inheritedWorkspaceId },
     ]));
+  });
+
+  it("serializes a linked issue status change with a retention archive", async () => {
+    const companyId = randomUUID();
+    const projectId = randomUUID();
+    const terminalIssueId = randomUUID();
+    const linkedIssueId = randomUUID();
+    const assigneeAgentId = randomUUID();
+    const workspaceId = randomUUID();
+    const now = new Date("2026-07-20T12:00:00.000Z");
+    const lockKey = 2_044_001;
+    let releaseBarrier!: () => void;
+    let signalBarrierHeld!: () => void;
+    const releaseBarrierPromise = new Promise<void>((resolve) => {
+      releaseBarrier = resolve;
+    });
+    const barrierHeld = new Promise<void>((resolve) => {
+      signalBarrierHeld = resolve;
+    });
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: "PAP",
+      requireBoardApprovalForNewAgents: false,
+    });
+    await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: true });
+    await db.insert(agents).values({
+      id: assigneeAgentId,
+      companyId,
+      name: "Linked issue assignee",
+      role: "engineer",
+      status: "active",
+    });
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Workspace retention",
+      status: "in_progress",
+    });
+    await db.insert(issues).values([
+      {
+        id: terminalIssueId,
+        companyId,
+        projectId,
+        title: "Completed source",
+        status: "done",
+        priority: "medium",
+      },
+      {
+        id: linkedIssueId,
+        companyId,
+        projectId,
+        title: "Completed linked issue",
+        status: "done",
+        priority: "medium",
+        assigneeAgentId,
+      },
+    ]);
+    await db.insert(executionWorkspaces).values({
+      id: workspaceId,
+      companyId,
+      projectId,
+      sourceIssueId: terminalIssueId,
+      mode: "shared_workspace",
+      strategyType: "project_primary",
+      name: "Terminal shared",
+      status: "active",
+      providerType: "local_fs",
+      cwd: "/tmp/project-primary",
+      lastUsedAt: new Date(now.getTime() - TERMINAL_SHARED_WORKSPACE_RETENTION_MS - 1),
+    });
+    await db
+      .update(issues)
+      .set({ executionWorkspaceId: workspaceId })
+      .where(inArray(issues.id, [terminalIssueId, linkedIssueId]));
+    await db.execute(sql.raw(`
+      CREATE FUNCTION "pause_execution_workspace_archive"()
+      RETURNS trigger
+      LANGUAGE plpgsql
+      AS $$
+      BEGIN
+        PERFORM pg_advisory_xact_lock(${lockKey});
+        RETURN NEW;
+      END;
+      $$;
+    `));
+    await db.execute(sql.raw(`
+      CREATE TRIGGER "pause_execution_workspace_archive"
+      BEFORE UPDATE OF "status" ON "execution_workspaces"
+      FOR EACH ROW
+      WHEN (NEW."status" = 'archived')
+      EXECUTE FUNCTION "pause_execution_workspace_archive"();
+    `));
+
+    const barrier = db.transaction(async (tx) => {
+      await tx.execute(sql`select pg_advisory_xact_lock(${lockKey})`);
+      signalBarrierHeld();
+      await releaseBarrierPromise;
+    });
+    await barrierHeld;
+    const archive = svc.archiveTerminalSharedLocalWorkspaces({ now });
+    const archiveIsWaiting = await waitForCondition(async () => {
+      const locks = await db.execute(sql<{ waiting: boolean }>`
+        select exists (
+          select 1
+          from pg_locks
+          where locktype = 'advisory'
+            and objid = ${lockKey}
+            and not granted
+        ) as waiting
+      `);
+      return locks[0]?.waiting === true;
+    });
+    expect(archiveIsWaiting).toBe(true);
+
+    const reopenLinkedIssue = issuesSvc.update(linkedIssueId, { status: "in_progress" });
+    const issueUpdateIsWaiting = await waitForCondition(async () => {
+      const locks = await db.execute(sql<{ waiting: boolean }>`
+        select exists (
+          select 1
+          from pg_locks
+          where locktype = 'transactionid'
+            and not granted
+        ) as waiting
+      `);
+      return locks[0]?.waiting === true;
+    });
+    expect(issueUpdateIsWaiting).toBe(true);
+
+    releaseBarrier();
+    await barrier;
+    await expect(archive).resolves.toEqual({ archived: 1 });
+    await expect(reopenLinkedIssue).resolves.toMatchObject({
+      status: "in_progress",
+      executionWorkspaceId: null,
+    });
+
+    await db.execute(sql.raw(`DROP TRIGGER "pause_execution_workspace_archive" ON "execution_workspaces"`));
+    await db.execute(sql.raw(`DROP FUNCTION "pause_execution_workspace_archive"()`));
   });
 
   it("keeps a child created during a retention claim detached from the archived workspace", async () => {

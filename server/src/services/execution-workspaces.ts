@@ -1948,13 +1948,28 @@ export function executionWorkspaceService(db: Db) {
           )`,
         ];
         const candidates = await tx
-          .select({ id: executionWorkspaces.id })
+          .select({
+            id: executionWorkspaces.id,
+            sourceIssueId: executionWorkspaces.sourceIssueId,
+          })
           .from(executionWorkspaces)
           .where(and(...retentionConditions))
           .orderBy(asc(executionWorkspaces.id))
           .for("update", { of: executionWorkspaces });
         const workspaceIds = candidates.map((candidate) => candidate.id);
         if (workspaceIds.length === 0) return { archived: 0 };
+
+        const sourceIssueIds = candidates
+          .map((candidate) => candidate.sourceIssueId)
+          .filter((id): id is string => id !== null);
+        await tx
+          .select({ id: issues.id })
+          .from(issues)
+          .where(or(
+            inArray(issues.id, sourceIssueIds),
+            inArray(issues.executionWorkspaceId, workspaceIds),
+          ))
+          .for("update", { of: issues });
 
         const archivedWorkspaces = await tx
           .update(executionWorkspaces)
