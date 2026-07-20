@@ -4,6 +4,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
 import { and, asc, desc, eq, inArray, isNull, lt, ne, or, sql } from "drizzle-orm";
+import { alias } from "drizzle-orm/pg-core";
 import type { Db } from "@paperclipai/db";
 import { executionWorkspaces, heartbeatRuns, issueComments, issues, projects, projectWorkspaces, workspaceRuntimeServices } from "@paperclipai/db";
 import type {
@@ -1919,6 +1920,7 @@ export function executionWorkspaceService(db: Db) {
       const cutoff = new Date(now.getTime() - TERMINAL_SHARED_WORKSPACE_RETENTION_MS);
 
       return await db.transaction(async (tx) => {
+        const linkedIssues = alias(issues, "retention_linked_issues");
         const candidates = await tx
           .select({ id: executionWorkspaces.id })
           .from(executionWorkspaces)
@@ -1937,6 +1939,15 @@ export function executionWorkspaceService(db: Db) {
               isNull(executionWorkspaces.closedAt),
               lt(executionWorkspaces.lastUsedAt, cutoff),
               inArray(issues.status, ["done", "cancelled"]),
+              sql`not exists (
+                select 1
+                from ${issues} as ${sql.raw("retention_linked_issues")}
+                where ${and(
+                  eq(linkedIssues.companyId, executionWorkspaces.companyId),
+                  eq(linkedIssues.executionWorkspaceId, executionWorkspaces.id),
+                  sql`${linkedIssues.status} not in ('done', 'cancelled')`,
+                )}
+              )`,
             ),
           );
         const workspaceIds = candidates.map((candidate) => candidate.id);
@@ -1958,7 +1969,10 @@ export function executionWorkspaceService(db: Db) {
             executionWorkspaceId: null,
             updatedAt: now,
           })
-          .where(inArray(issues.executionWorkspaceId, workspaceIds));
+          .where(and(
+            inArray(issues.executionWorkspaceId, workspaceIds),
+            inArray(issues.status, ["done", "cancelled"]),
+          ));
 
         return { archived: workspaceIds.length };
       });

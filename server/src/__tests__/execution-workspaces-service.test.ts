@@ -430,11 +430,14 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     const terminalIssueId = randomUUID();
     const cancelledIssueId = randomUUID();
     const openIssueId = randomUUID();
+    const inheritedTerminalIssueId = randomUUID();
+    const inheritedOpenIssueId = randomUUID();
     const terminalWorkspaceId = randomUUID();
     const cancelledWorkspaceId = randomUUID();
     const openWorkspaceId = randomUUID();
     const recentWorkspaceId = randomUUID();
     const isolatedWorkspaceId = randomUUID();
+    const inheritedWorkspaceId = randomUUID();
 
     await db.insert(companies).values({
       id: companyId,
@@ -470,6 +473,23 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
         companyId,
         projectId,
         title: "Open",
+        status: "in_progress",
+        priority: "medium",
+      },
+      {
+        id: inheritedTerminalIssueId,
+        companyId,
+        projectId,
+        title: "Completed parent",
+        status: "done",
+        priority: "medium",
+      },
+      {
+        id: inheritedOpenIssueId,
+        companyId,
+        projectId,
+        parentId: inheritedTerminalIssueId,
+        title: "Open child",
         status: "in_progress",
         priority: "medium",
       },
@@ -540,6 +560,19 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
         cwd: "/tmp/worktree",
         lastUsedAt: staleLastUsedAt,
       },
+      {
+        id: inheritedWorkspaceId,
+        companyId,
+        projectId,
+        sourceIssueId: inheritedTerminalIssueId,
+        mode: "shared_workspace",
+        strategyType: "project_primary",
+        name: "Inherited shared",
+        status: "idle",
+        providerType: "local_fs",
+        cwd: "/tmp/project-primary",
+        lastUsedAt: staleLastUsedAt,
+      },
     ]);
     await db
       .update(issues)
@@ -549,6 +582,10 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       .update(issues)
       .set({ executionWorkspaceId: cancelledWorkspaceId })
       .where(inArray(issues.id, [cancelledIssueId]));
+    await db
+      .update(issues)
+      .set({ executionWorkspaceId: inheritedWorkspaceId })
+      .where(inArray(issues.id, [inheritedTerminalIssueId, inheritedOpenIssueId]));
 
     const result = await svc.archiveTerminalSharedLocalWorkspaces({ now });
 
@@ -567,6 +604,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
         openWorkspaceId,
         recentWorkspaceId,
         isolatedWorkspaceId,
+        inheritedWorkspaceId,
       ]));
     const byId = new Map(workspaces.map((workspace) => [workspace.id, workspace]));
 
@@ -583,14 +621,17 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     expect(byId.get(openWorkspaceId)).toMatchObject({ status: "active", closedAt: null });
     expect(byId.get(recentWorkspaceId)).toMatchObject({ status: "active", closedAt: null });
     expect(byId.get(isolatedWorkspaceId)).toMatchObject({ status: "active", closedAt: null });
+    expect(byId.get(inheritedWorkspaceId)).toMatchObject({ status: "idle", closedAt: null });
 
     const linkedIssues = await db
       .select({ id: issues.id, executionWorkspaceId: issues.executionWorkspaceId })
       .from(issues)
-      .where(inArray(issues.id, [terminalIssueId, cancelledIssueId]));
+      .where(inArray(issues.id, [terminalIssueId, cancelledIssueId, inheritedTerminalIssueId, inheritedOpenIssueId]));
     expect(linkedIssues).toEqual(expect.arrayContaining([
       { id: terminalIssueId, executionWorkspaceId: null },
       { id: cancelledIssueId, executionWorkspaceId: null },
+      { id: inheritedTerminalIssueId, executionWorkspaceId: inheritedWorkspaceId },
+      { id: inheritedOpenIssueId, executionWorkspaceId: inheritedWorkspaceId },
     ]));
   });
 
