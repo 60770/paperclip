@@ -14785,9 +14785,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         ? executionState.currentParticipant
         : null;
       const recoveryHeartbeatPolicy = recoveryAgent ? parseHeartbeatPolicy(recoveryAgent) : null;
+      const isReviewParticipantRecoveryRun = isExecutionReviewParticipantRecoveryRun(run);
       const successfulApprovalHold =
         executionState?.currentStageType === "approval" &&
         run.status === "succeeded" &&
+        !isReviewParticipantRecoveryRun &&
         isExecutionReviewParticipantRecoveryEligibleRun(run) &&
         isExecutionReviewParticipantRunForStage(run, executionState.currentStageId) &&
         (
@@ -14819,7 +14821,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         if (
           options.suppressImmediateRecovery ||
           existingReviewParticipantExecutionPath ||
-          issueHasPersistedMonitor ||
+          (issueHasPersistedMonitor && !isReviewParticipantRecoveryRun) ||
           await isAutomaticRecoverySuppressedByPauseHold(db, issue.companyId, issue.id, treeControlSvc)
         ) {
           return { kind: "released" as const };
@@ -14836,7 +14838,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         const shouldBlockReviewRecovery =
           !recoveryAgentInvokable ||
           !recoveryAgent ||
-          isExecutionReviewParticipantRecoveryRun(run);
+          isReviewParticipantRecoveryRun;
         if (shouldBlockReviewRecovery) {
           return {
             kind: "blocked" as const,
