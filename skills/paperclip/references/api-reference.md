@@ -1218,11 +1218,34 @@ Terminal states: `done`, `cancelled`
 | GET    | `/api/issues/:issueId/approvals`   | List approvals linked to issue                                                           |
 | POST   | `/api/issues/:issueId/approvals`   | Link approval to issue                                                                   |
 | DELETE | `/api/issues/:issueId/approvals/:approvalId` | Unlink approval from issue                                                     |
+| GET    | `/api/issues/:issueId/attachments` | List issue attachments                                                                  |
+| POST   | `/api/companies/:companyId/issues/:issueId/attachments` | Upload one multipart attachment (`file`)                              |
+| GET    | `/api/attachments/:attachmentId/content` | Read raw attachment content; intentionally unavailable through the sandbox bridge          |
+| GET    | `/api/attachments/:attachmentId/content/chunk?offset=:offset&length=:bytes&encoding=base64` | Read one authorized JSON/base64 chunk in sandbox (`length` 1–131072; 128 MiB cumulative per run) |
+| DELETE | `/api/attachments/:attachmentId`  | Delete an attachment                                                                     |
 | GET    | `/api/issues/:issueId/heartbeat-context` | Compact issue context including `currentExecutionWorkspace` when one is linked |
 | GET    | `/api/execution-workspaces/:workspaceId` | Execution workspace detail including runtime services and service URLs |
 | POST   | `/api/execution-workspaces/:workspaceId/runtime-services/start` | Start configured workspace services |
 | POST   | `/api/execution-workspaces/:workspaceId/runtime-services/restart` | Restart configured workspace services |
 | POST   | `/api/execution-workspaces/:workspaceId/runtime-services/stop` | Stop workspace runtime services |
+
+Attachment chunk responses contain only bounded content and integrity metadata:
+
+```json
+{
+  "attachmentId": "uuid",
+  "encoding": "base64",
+  "offset": 0,
+  "length": 131072,
+  "nextOffset": 131072,
+  "eof": false,
+  "byteSize": 8000000,
+  "sha256": "hex",
+  "data": "base64"
+}
+```
+
+Advance with `nextOffset` until `eof=true`, decode each `data` value, then verify the reconstructed file against `sha256`. The sandbox bridge rejects raw content reads, non-canonical or extra query parameters, chunks above 131072 raw bytes, and reads above the 128 MiB cumulative run budget.
 
 ### Companies, Projects, Goals
 

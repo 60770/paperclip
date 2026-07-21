@@ -14,6 +14,8 @@ const DEFAULT_BRIDGE_STOP_TIMEOUT_MS = 2_000;
 const DEFAULT_BRIDGE_MAX_QUEUE_DEPTH = 64;
 const DEFAULT_BRIDGE_MAX_BODY_BYTES = 256 * 1024;
 const DEFAULT_BRIDGE_MAX_ATTACHMENT_BODY_BYTES = 12 * 1024 * 1024;
+const DEFAULT_BRIDGE_ATTACHMENT_CHUNK_RAW_BYTES = 128 * 1024;
+const DEFAULT_BRIDGE_MAX_ATTACHMENT_READ_BYTES = 128 * 1024 * 1024;
 const REMOTE_WRITE_BASE64_CHUNK_SIZE = 32 * 1024;
 const DECODE_BASE64_VALIDATION_CHUNK_BYTES = 3 * 1024;
 const SANDBOX_CALLBACK_BRIDGE_ENTRYPOINT = "paperclip-bridge-server.mjs";
@@ -23,8 +25,13 @@ const SANDBOX_EXEC_CHANNEL_BRIDGE = "bridge";
 export const DEFAULT_SANDBOX_CALLBACK_BRIDGE_MAX_BODY_BYTES = DEFAULT_BRIDGE_MAX_BODY_BYTES;
 export const DEFAULT_SANDBOX_CALLBACK_BRIDGE_MAX_ATTACHMENT_BODY_BYTES =
   DEFAULT_BRIDGE_MAX_ATTACHMENT_BODY_BYTES;
+export const DEFAULT_SANDBOX_CALLBACK_BRIDGE_ATTACHMENT_CHUNK_RAW_BYTES =
+  DEFAULT_BRIDGE_ATTACHMENT_CHUNK_RAW_BYTES;
+export const DEFAULT_SANDBOX_CALLBACK_BRIDGE_MAX_ATTACHMENT_READ_BYTES =
+  DEFAULT_BRIDGE_MAX_ATTACHMENT_READ_BYTES;
 
 const ISSUE_ATTACHMENT_UPLOAD_PATH = /^\/api\/companies\/[^/]+\/issues\/[^/]+\/attachments$/;
+const ATTACHMENT_CONTENT_CHUNK_PATH = /^\/api\/attachments\/[^/]+\/content\/chunk$/;
 
 export interface SandboxCallbackBridgeRouteRule {
   method: string;
@@ -77,6 +84,7 @@ export const DEFAULT_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST: readonly SandboxCa
   // queue protocol so binary file contents remain byte-for-byte intact.
   { method: "GET", path: /^\/api\/issues\/[^/]+\/attachments$/ },
   { method: "POST", path: ISSUE_ATTACHMENT_UPLOAD_PATH },
+  { method: "GET", path: ATTACHMENT_CONTENT_CHUNK_PATH },
   { method: "DELETE", path: /^\/api\/attachments\/[^/]+$/ },
 
   // Work products: publish branch/commit/artifact metadata for completed work.
@@ -196,6 +204,45 @@ function normalizeMethod(value: string | null | undefined): string {
 
 function normalizeTimeoutMs(value: number | null | undefined, fallback: number): number {
   return typeof value === "number" && Number.isFinite(value) && value > 0 ? Math.trunc(value) : fallback;
+}
+
+function parseCanonicalNonNegativeInteger(value: string | null): number | null {
+  if (value === null || !/^(?:0|[1-9][0-9]*)$/.test(value)) return null;
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) ? parsed : null;
+}
+
+function parseAttachmentChunkRequest(
+  request: Pick<SandboxCallbackBridgeRequest, "path" | "query" | "body">,
+): { kind: "none" } | { kind: "invalid" } | { kind: "chunk"; length: number } {
+  if (!ATTACHMENT_CONTENT_CHUNK_PATH.test(request.path)) return { kind: "none" };
+  if (request.body.length > 0) return { kind: "invalid" };
+
+  const query = request.query.trim();
+  const params = new URLSearchParams(query.startsWith("?") ? query.slice(1) : query);
+  const keys = [...params.keys()];
+  if (
+    keys.length !== 3 ||
+    new Set(keys).size !== 3 ||
+    !keys.every((key) => key === "offset" || key === "length" || key === "encoding")
+  ) {
+    return { kind: "invalid" };
+  }
+
+  const offset = parseCanonicalNonNegativeInteger(params.get("offset"));
+  const length = parseCanonicalNonNegativeInteger(params.get("length"));
+  if (
+    offset === null ||
+    length === null ||
+    length <= 0 ||
+    length > DEFAULT_BRIDGE_ATTACHMENT_CHUNK_RAW_BYTES ||
+    !Number.isSafeInteger(offset + length) ||
+    params.get("encoding") !== "base64"
+  ) {
+    return { kind: "invalid" };
+  }
+
+  return { kind: "chunk", length };
 }
 
 function toBuffer(bytes: Buffer | Uint8Array | ArrayBuffer): Buffer {
@@ -662,12 +709,17 @@ export async function startSandboxCallbackBridgeWorker(input: {
   }>;
   maxBodyBytes?: number | null;
   maxAttachmentBodyBytes?: number | null;
+  maxAttachmentReadBytes?: number | null;
 }): Promise<SandboxCallbackBridgeWorkerHandle> {
   const pollIntervalMs = normalizeTimeoutMs(input.pollIntervalMs, DEFAULT_BRIDGE_POLL_INTERVAL_MS);
   const maxBodyBytes = normalizeTimeoutMs(input.maxBodyBytes, DEFAULT_BRIDGE_MAX_BODY_BYTES);
   const maxAttachmentBodyBytes = normalizeTimeoutMs(
     input.maxAttachmentBodyBytes,
     DEFAULT_BRIDGE_MAX_ATTACHMENT_BODY_BYTES,
+  );
+  const maxAttachmentReadBytes = normalizeTimeoutMs(
+    input.maxAttachmentReadBytes,
+    DEFAULT_BRIDGE_MAX_ATTACHMENT_READ_BYTES,
   );
   const directories = sandboxCallbackBridgeDirectories(input.queueDir);
   await input.client.makeDir(directories.rootDir);
@@ -679,6 +731,7 @@ export async function startSandboxCallbackBridgeWorker(input: {
   let inFlight = 0;
   let settled = false;
   let stopDeadline = Number.POSITIVE_INFINITY;
+  let attachmentReadBytes = 0;
   let settleResolve: (() => void) | null = null;
   const settledPromise = new Promise<void>((resolve) => {
     settleResolve = resolve;
@@ -756,6 +809,40 @@ export async function startSandboxCallbackBridgeWorker(input: {
       });
       await input.client.remove(requestPath);
       return;
+    }
+
+    const attachmentChunkRequest = parseAttachmentChunkRequest(request);
+    if (attachmentChunkRequest.kind === "invalid") {
+      await writeBridgeResponse(input.client, requestPath, responsePath, {
+        id: request.id,
+        status: 400,
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          error: `Invalid attachment chunk request. Expected offset=<non-negative integer>, length=<1..${DEFAULT_BRIDGE_ATTACHMENT_CHUNK_RAW_BYTES}>, and encoding=base64.`,
+        }),
+        completedAt: new Date().toISOString(),
+      });
+      await input.client.remove(requestPath);
+      return;
+    }
+    if (
+      attachmentChunkRequest.kind === "chunk" &&
+      attachmentReadBytes + attachmentChunkRequest.length > maxAttachmentReadBytes
+    ) {
+      await writeBridgeResponse(input.client, requestPath, responsePath, {
+        id: request.id,
+        status: 429,
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          error: `Bridge attachment read budget exceeded the configured limit of ${maxAttachmentReadBytes} bytes for this run.`,
+        }),
+        completedAt: new Date().toISOString(),
+      });
+      await input.client.remove(requestPath);
+      return;
+    }
+    if (attachmentChunkRequest.kind === "chunk") {
+      attachmentReadBytes += attachmentChunkRequest.length;
     }
 
     try {
