@@ -409,6 +409,7 @@ Operational policy:
 - V1 attachment serving contract:
   - Default upload allowlist includes common images, PDF, plain text/markdown/JSON/CSV/HTML, ZIP, and video artifacts (`video/mp4`, `video/webm`, `video/quicktime`).
   - Attachment reads are company-scoped and expose stable path metadata: `contentPath`/`openPath` for inline-safe viewing and `downloadPath` for forced download.
+  - Sandboxed agents read large attachments through `GET /api/attachments/:attachmentId/content/chunk` with canonical `offset`, bounded `length`, and `encoding=base64`. Each response is JSON, re-runs company and issue-read authorization, and exposes no storage path or URL. The reverse bridge keeps raw content downloads denied and enforces a cumulative per-run read budget.
   - Inline-safe responses use `Content-Disposition: inline`; unsafe types and explicit download requests use `attachment`.
   - Video attachments are inline-safe and support single `Range: bytes=start-end` requests with `206`, `Content-Range`, and `Accept-Ranges: bytes` for browser playback/seeking.
 - Attachment-backed artifact work products use `type: "artifact"`, `provider: "paperclip"`, and metadata with `attachmentId`, `contentType`, `byteSize`, `contentPath`, `openPath`, `downloadPath`, and optional `originalFilename`.
