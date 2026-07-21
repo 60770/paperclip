@@ -4102,20 +4102,28 @@ export function issueService(db: Db) {
     projectId: string | null | undefined,
     executionWorkspaceId: string,
     dbOrTx: DbReader = db,
+    options: { forUpdate?: boolean; requireUnarchived?: boolean } = {},
   ) {
-    const workspace = await dbOrTx
+    const query = dbOrTx
       .select({
         id: executionWorkspaces.id,
         companyId: executionWorkspaces.companyId,
         projectId: executionWorkspaces.projectId,
+        status: executionWorkspaces.status,
       })
       .from(executionWorkspaces)
-      .where(eq(executionWorkspaces.id, executionWorkspaceId))
+      .where(eq(executionWorkspaces.id, executionWorkspaceId));
+    const workspace = await (options.forUpdate
+      ? query.for("update", { of: executionWorkspaces })
+      : query)
       .then((rows) => rows[0] ?? null);
     if (!workspace) throw notFound("Execution workspace not found");
     if (workspace.companyId !== companyId) throw unprocessable("Execution workspace must belong to same company");
     if (projectId && workspace.projectId !== projectId) {
       throw unprocessable("Execution workspace must belong to the selected project");
+    }
+    if (options.requireUnarchived && workspace.status === "archived") {
+      throw unprocessable("Execution workspace is archived");
     }
     return workspace;
   }
@@ -6118,11 +6126,13 @@ export function issueService(db: Db) {
               .select({
                 id: executionWorkspaces.id,
                 mode: executionWorkspaces.mode,
+                status: executionWorkspaces.status,
               })
               .from(executionWorkspaces)
               .where(eq(executionWorkspaces.id, workspaceSource.executionWorkspaceId))
+              .for("update", { of: executionWorkspaces })
               .then((rows) => rows[0] ?? null);
-            if (sourceWorkspace) {
+            if (sourceWorkspace && sourceWorkspace.status !== "archived") {
               executionWorkspaceId = sourceWorkspace.id;
               executionWorkspacePreference = "reuse_existing";
               executionWorkspaceSettings = {
@@ -6194,7 +6204,10 @@ export function issueService(db: Db) {
           await assertValidProjectWorkspace(companyId, issueData.projectId, projectWorkspaceId, tx);
         }
         if (executionWorkspaceId) {
-          await assertValidExecutionWorkspace(companyId, issueData.projectId, executionWorkspaceId, tx);
+          await assertValidExecutionWorkspace(companyId, issueData.projectId, executionWorkspaceId, tx, {
+            forUpdate: true,
+            requireUnarchived: true,
+          });
         }
         if (isolatedWorkspacesEnabled && issueData.executionWorkspaceSettings !== undefined) {
           assertExplicitPinnedWorktreeIssueRunnable({
@@ -6461,6 +6474,15 @@ export function issueService(db: Db) {
       }
 
       const runUpdate = async (tx: any) => {
+        if (issueData.executionWorkspaceId !== undefined && nextExecutionWorkspaceId) {
+          await assertValidExecutionWorkspace(
+            existing.companyId,
+            nextProjectId,
+            nextExecutionWorkspaceId,
+            tx,
+            { forUpdate: true, requireUnarchived: true },
+          );
+        }
         const defaultCompanyGoal = await getDefaultCompanyGoal(tx, existing.companyId);
         const [currentProjectGoalId, nextProjectGoalId] = await Promise.all([
           getProjectDefaultGoalId(tx, existing.companyId, existing.projectId),
