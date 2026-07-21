@@ -1135,93 +1135,108 @@ describe("sandbox adapter execution targets", () => {
     }
   });
 
-  it("forwards a 4 MiB issue attachment through the sandbox bridge without stack overflow", async () => {
-    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-execution-target-bridge-4mb-"));
-    cleanupDirs.push(rootDir);
-    const remoteCwd = path.join(rootDir, "workspace");
-    const runtimeRootDir = path.join(remoteCwd, ".paperclip-runtime", "codex");
-    await mkdir(runtimeRootDir, { recursive: true });
-
-    const boundary = "paperclip-bridge-4mb-boundary";
-    const multipartBody = buildMultipartAttachmentBody(4 * 1024 * 1024, boundary);
-    const expectedBytes = multipartBody.byteLength;
-    const expectedHash = sha256Hex(multipartBody);
-    let receivedBody = Buffer.alloc(0);
-    let responsePayload: { id: string; bytes: number; sha256: string } | null = null;
-    const apiServer = createServer(async (req, res) => {
-      const chunks: Buffer[] = [];
-      for await (const chunk of req) {
-        chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
-      }
-      receivedBody = Buffer.concat(chunks);
-      responsePayload = {
-        id: "attachment-4mb",
-        bytes: receivedBody.byteLength,
-        sha256: sha256Hex(receivedBody),
-      };
-      res.writeHead(201, { "content-type": "application/json" });
-      res.end(JSON.stringify(responsePayload));
-    });
-    await new Promise<void>((resolve, reject) => {
-      apiServer.once("error", reject);
-      apiServer.listen(0, "127.0.0.1", () => resolve());
-    });
-    const address = apiServer.address();
-    if (!address || typeof address === "string") {
-      throw new Error("Expected the attachment bridge API server to listen on a TCP port.");
-    }
-
-    const target: AdapterSandboxExecutionTarget = {
-      kind: "remote",
-      transport: "sandbox",
-      providerKey: "e2b",
-      environmentId: "env-1",
-      leaseId: "lease-1",
-      remoteCwd,
-      runner: createLargeOutputLocalSandboxRunner(),
-      timeoutMs: 30_000,
-    };
-    const bridge = await startAdapterExecutionTargetPaperclipBridge({
-      runId: "run-bridge-attachment-4mb",
-      target,
-      runtimeRootDir,
-      adapterKey: "codex",
-      hostApiToken: "real-run-jwt",
-      hostApiUrl: `http://127.0.0.1:${address.port}`,
-      maxAttachmentBodyBytes: expectedBytes,
-    });
-    try {
-      const response = await fetch(
-        `${bridge!.env.PAPERCLIP_API_URL}/api/companies/company-1/issues/issue-1/attachments`,
-        {
-          method: "POST",
-          headers: {
-            authorization: `Bearer ${bridge!.env.PAPERCLIP_API_KEY}`,
-            "content-type": `multipart/form-data; boundary=${boundary}`,
-          },
-          body: new Uint8Array(multipartBody),
-        },
+  it.each([4, 8, 11])(
+    "forwards a %d MiB issue attachment through the sandbox bridge without stack overflow",
+    async (attachmentMiB) => {
+      const rootDir = await mkdtemp(
+        path.join(os.tmpdir(), `paperclip-execution-target-bridge-${attachmentMiB}mb-`),
       );
+      cleanupDirs.push(rootDir);
+      const remoteCwd = path.join(rootDir, "workspace");
+      const runtimeRootDir = path.join(remoteCwd, ".paperclip-runtime", "codex");
+      await mkdir(runtimeRootDir, { recursive: true });
 
-      const responseBody = await response.json();
-      expect(response.status, JSON.stringify(responseBody)).toBe(201);
-      expect(responseBody).toEqual({
-        id: "attachment-4mb",
-        bytes: expectedBytes,
-        sha256: expectedHash,
+      const boundary = `paperclip-bridge-${attachmentMiB}mb-sensitive-boundary`;
+      const attachmentLimit = 12 * 1024 * 1024;
+      const multipartBody = buildMultipartAttachmentBody(attachmentMiB * 1024 * 1024, boundary);
+      expect(multipartBody.byteLength).toBeLessThan(attachmentLimit);
+      const expectedBytes = multipartBody.byteLength;
+      const expectedHash = sha256Hex(multipartBody);
+      const hostApiToken = `real-run-jwt-${attachmentMiB}mb`;
+      const bridgeLogs: string[] = [];
+      let receivedBody = Buffer.alloc(0);
+      let responsePayload: { id: string; bytes: number; sha256: string } | null = null;
+      const apiServer = createServer(async (req, res) => {
+        const chunks: Buffer[] = [];
+        for await (const chunk of req) {
+          chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+        }
+        receivedBody = Buffer.concat(chunks);
+        responsePayload = {
+          id: `attachment-${attachmentMiB}mb`,
+          bytes: receivedBody.byteLength,
+          sha256: sha256Hex(receivedBody),
+        };
+        res.writeHead(201, { "content-type": "application/json" });
+        res.end(JSON.stringify(responsePayload));
       });
-      expect(responsePayload).toEqual({
-        id: "attachment-4mb",
-        bytes: expectedBytes,
-        sha256: expectedHash,
+      await new Promise<void>((resolve, reject) => {
+        apiServer.once("error", reject);
+        apiServer.listen(0, "127.0.0.1", () => resolve());
       });
-      expect(receivedBody.byteLength).toBe(expectedBytes);
-      expect(sha256Hex(receivedBody)).toBe(expectedHash);
-    } finally {
-      await bridge?.stop();
-      await new Promise<void>((resolve) => apiServer.close(() => resolve()));
-    }
-  });
+      const address = apiServer.address();
+      if (!address || typeof address === "string") {
+        throw new Error("Expected the attachment bridge API server to listen on a TCP port.");
+      }
+
+      const target: AdapterSandboxExecutionTarget = {
+        kind: "remote",
+        transport: "sandbox",
+        providerKey: "e2b",
+        environmentId: "env-1",
+        leaseId: "lease-1",
+        remoteCwd,
+        runner: createLargeOutputLocalSandboxRunner(),
+        timeoutMs: 30_000,
+      };
+      const bridge = await startAdapterExecutionTargetPaperclipBridge({
+        runId: `run-bridge-attachment-${attachmentMiB}mb`,
+        target,
+        runtimeRootDir,
+        adapterKey: "codex",
+        hostApiToken,
+        hostApiUrl: `http://127.0.0.1:${address.port}`,
+        maxAttachmentBodyBytes: attachmentLimit,
+        onLog: async (_stream, chunk) => {
+          bridgeLogs.push(chunk);
+        },
+      });
+      try {
+        const response = await fetch(
+          `${bridge!.env.PAPERCLIP_API_URL}/api/companies/company-1/issues/issue-1/attachments`,
+          {
+            method: "POST",
+            headers: {
+              authorization: `Bearer ${bridge!.env.PAPERCLIP_API_KEY}`,
+              "content-type": `multipart/form-data; boundary=${boundary}`,
+            },
+            body: new Uint8Array(multipartBody),
+          },
+        );
+
+        const responseBody = await response.json();
+        expect(response.status, JSON.stringify(responseBody)).toBe(201);
+        expect(responseBody).toEqual({
+          id: `attachment-${attachmentMiB}mb`,
+          bytes: expectedBytes,
+          sha256: expectedHash,
+        });
+        expect(responsePayload).toEqual({
+          id: `attachment-${attachmentMiB}mb`,
+          bytes: expectedBytes,
+          sha256: expectedHash,
+        });
+        expect(receivedBody.byteLength).toBe(expectedBytes);
+        expect(sha256Hex(receivedBody)).toBe(expectedHash);
+        expect(bridgeLogs.join("\n")).not.toContain(hostApiToken);
+        expect(bridgeLogs.join("\n")).not.toContain(bridge!.env.PAPERCLIP_API_KEY);
+        expect(bridgeLogs.join("\n")).not.toContain(boundary);
+      } finally {
+        await bridge?.stop();
+        await new Promise<void>((resolve) => apiServer.close(() => resolve()));
+      }
+    },
+  );
 
   it("forwards an attachment near the default cap through the sandbox bridge", async () => {
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-execution-target-bridge-nearcap-"));
@@ -1310,15 +1325,20 @@ describe("sandbox adapter execution targets", () => {
     }
   });
 
-  it("rejects attachments over attachment limit before forwarding", async () => {
+  it("rejects a multipart body over the default 12 MiB limit before forwarding", async () => {
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-execution-target-bridge-overcap-"));
     cleanupDirs.push(rootDir);
     const remoteCwd = path.join(rootDir, "workspace");
     const runtimeRootDir = path.join(remoteCwd, ".paperclip-runtime", "codex");
     await mkdir(runtimeRootDir, { recursive: true });
 
-    const boundary = "paperclip-bridge-overcap-boundary";
-    const multipartBody = buildMultipartAttachmentBody(1024 * 1024, boundary);
+    const boundary = "paperclip-bridge-overcap-sensitive-boundary";
+    const attachmentLimit = 12 * 1024 * 1024;
+    const multipartBody = buildMultipartAttachmentBody(attachmentLimit, boundary);
+    expect(multipartBody.byteLength).toBeGreaterThan(attachmentLimit);
+    vi.stubEnv("PAPERCLIP_ATTACHMENT_MAX_BYTES", "");
+    const hostApiToken = "real-run-jwt-overcap";
+    const bridgeLogs: string[] = [];
     let received = false;
     const apiServer = createServer(async (_req, res) => {
       received = true;
@@ -1349,9 +1369,11 @@ describe("sandbox adapter execution targets", () => {
       target,
       runtimeRootDir,
       adapterKey: "codex",
-      hostApiToken: "real-run-jwt",
+      hostApiToken,
       hostApiUrl: `http://127.0.0.1:${address.port}`,
-      maxAttachmentBodyBytes: multipartBody.byteLength - 1,
+      onLog: async (_stream, chunk) => {
+        bridgeLogs.push(chunk);
+      },
     });
     try {
       const response = await fetch(
@@ -1371,6 +1393,10 @@ describe("sandbox adapter execution targets", () => {
         error: expect.stringContaining("Bridge request body exceeded the configured size limit"),
       });
       expect(received).toBe(false);
+      expect(bridgeLogs.join("\n")).not.toContain(hostApiToken);
+      expect(bridgeLogs.join("\n")).not.toContain(bridge!.env.PAPERCLIP_API_KEY);
+      expect(bridgeLogs.join("\n")).not.toContain(boundary);
+      expect((await readRuntimeTextFiles(runtimeRootDir)).join("\n")).not.toContain(boundary);
     } finally {
       await bridge?.stop();
       await new Promise<void>((resolve) => apiServer.close(() => resolve()));
