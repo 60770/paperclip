@@ -16,6 +16,8 @@ const ACTIVE_RUN_STATUSES = new Set(["queued", "scheduled_retry", "running"]);
 const RUN_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const TRASH_ENTRY_PATTERN = /^([0-9a-f-]{36})\.([0-9a-f-]{36})$/i;
 const REMOTE_COMMAND_TIMEOUT_SEC = 120;
+const MAX_DELETE_BATCH_DIRECTORIES = 32;
+const MAX_DELETE_COMMAND_BYTES = 64 * 1024;
 
 interface RemoteRunState {
   id: string;
@@ -336,6 +338,36 @@ function buildDeleteCommand(input: {
   return lines.join("\n");
 }
 
+function buildDeleteCommands(input: {
+  runRoot: string;
+  sweepId: string;
+  directories: RemoteRunDirectory[];
+  diskPath: string;
+}) {
+  const commands: string[] = [];
+  let batch: RemoteRunDirectory[] = [];
+
+  for (const directory of input.directories) {
+    const candidateBatch = [...batch, directory];
+    const candidateCommand = buildDeleteCommand({ ...input, directories: candidateBatch });
+    if (
+      batch.length > 0 &&
+      (candidateBatch.length > MAX_DELETE_BATCH_DIRECTORIES ||
+        Buffer.byteLength(candidateCommand, "utf8") > MAX_DELETE_COMMAND_BYTES)
+    ) {
+      commands.push(buildDeleteCommand({ ...input, directories: batch }));
+      batch = [directory];
+    } else {
+      batch = candidateBatch;
+    }
+  }
+
+  if (batch.length > 0) {
+    commands.push(buildDeleteCommand({ ...input, directories: batch }));
+  }
+  return commands;
+}
+
 function parseDeleteOutput(stdout: string) {
   let deletedCount = 0;
   let bytesFreed = 0;
@@ -516,37 +548,52 @@ export async function sweepRemoteRunRetention(input: {
   result.eligibleCount = eligible.length;
 
   if (eligible.length > 0) {
-    let deletion: RemoteCommandResult;
-    try {
-      deletion = await executeRemoteCommand({
-        target: input.target,
-        command: buildDeleteCommand({
-          runRoot,
-          sweepId: input.currentRunId,
-          directories: eligible,
-          diskPath,
-        }),
-        timeoutSec: REMOTE_COMMAND_TIMEOUT_SEC,
-      });
-    } catch (error) {
-      result.errorCount += 1;
-      logger.warn({ err: error, ...result, runId: input.currentRunId }, "remote run retention deletion failed");
-      return result;
+    const deleteCommands = buildDeleteCommands({
+      runRoot,
+      sweepId: input.currentRunId,
+      directories: eligible,
+      diskPath,
+    });
+    for (const [batchIndex, command] of deleteCommands.entries()) {
+      let deletion: RemoteCommandResult;
+      try {
+        deletion = await executeRemoteCommand({
+          target: input.target,
+          command,
+          timeoutSec: REMOTE_COMMAND_TIMEOUT_SEC,
+        });
+      } catch (error) {
+        result.errorCount += 1;
+        logger.warn(
+          { err: error, ...result, runId: input.currentRunId, batchIndex, batchCount: deleteCommands.length },
+          "remote run retention deletion failed",
+        );
+        break;
+      }
+      if (deletion.exitCode !== 0 || deletion.timedOut) {
+        result.errorCount += 1;
+        logger.warn(
+          {
+            ...result,
+            runId: input.currentRunId,
+            batchIndex,
+            batchCount: deleteCommands.length,
+            exitCode: deletion.exitCode,
+            timedOut: deletion.timedOut,
+          },
+          "remote run retention deletion failed",
+        );
+        break;
+      }
+      const parsedDeletion = parseDeleteOutput(deletion.stdout);
+      result.deletedCount += parsedDeletion.deletedCount;
+      result.bytesFreed += parsedDeletion.bytesFreed;
+      result.errorCount += parsedDeletion.errorCount;
+      if (parsedDeletion.diskUsedPercent !== null) {
+        result.diskUsedPercentAfter = parsedDeletion.diskUsedPercent;
+        result.diskUsedPercent = parsedDeletion.diskUsedPercent;
+      }
     }
-    if (deletion.exitCode !== 0 || deletion.timedOut) {
-      result.errorCount += 1;
-      logger.warn(
-        { ...result, runId: input.currentRunId, exitCode: deletion.exitCode, timedOut: deletion.timedOut },
-        "remote run retention deletion failed",
-      );
-      return result;
-    }
-    const parsedDeletion = parseDeleteOutput(deletion.stdout);
-    result.deletedCount = parsedDeletion.deletedCount;
-    result.bytesFreed = parsedDeletion.bytesFreed;
-    result.errorCount += parsedDeletion.errorCount;
-    result.diskUsedPercentAfter = parsedDeletion.diskUsedPercent;
-    result.diskUsedPercent = parsedDeletion.diskUsedPercent ?? result.diskUsedPercent;
   }
 
   result.diskWarning = [result.diskUsedPercentBefore, result.diskUsedPercentAfter]

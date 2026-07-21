@@ -17,6 +17,10 @@ const RECENT_TERMINAL_RUN_ID = "30000000-0000-4000-8000-000000000002";
 const RETRY_RUN_ID = "30000000-0000-4000-8000-000000000003";
 const UNKNOWN_RUN_ID = "40000000-0000-4000-8000-000000000001";
 const NOW = new Date("2026-07-21T12:00:00.000Z");
+const MANY_TERMINAL_RUN_IDS = Array.from(
+  { length: 70 },
+  (_, index) => `50000000-0000-4000-8000-${String(index + 1).padStart(12, "0")}`,
+);
 
 const cleanupDirs: string[] = [];
 
@@ -258,5 +262,35 @@ describe("remote run retention", () => {
     expect(first.deletedCount + second.deletedCount).toBe(1);
     expect(first.errorCount + second.errorCount).toBe(0);
     await expect(mkdir(path.join(runRoot, OLD_TERMINAL_RUN_ID))).resolves.toBeUndefined();
+  });
+
+  it("batches large retention sweeps by directory count and command bytes", async () => {
+    const { remoteCwd } = await createRemoteRoot(MANY_TERMINAL_RUN_IDS);
+    const deleteCommands: string[] = [];
+
+    const result = await sweep({
+      remoteCwd,
+      states: MANY_TERMINAL_RUN_IDS.map((id) => ({
+        id,
+        status: "succeeded",
+        finishedAt: new Date("2026-07-20T11:00:00.000Z"),
+      })),
+      executeRemoteCommand: async (input) => {
+        if (/^claim_name=/m.test(input.command)) deleteCommands.push(input.command);
+        return await executeLocalCommand(input);
+      },
+    });
+
+    expect(result).toMatchObject({
+      scannedCount: MANY_TERMINAL_RUN_IDS.length,
+      eligibleCount: MANY_TERMINAL_RUN_IDS.length,
+      deletedCount: MANY_TERMINAL_RUN_IDS.length,
+      errorCount: 0,
+    });
+    expect(deleteCommands.length).toBeGreaterThan(1);
+    for (const command of deleteCommands) {
+      expect(command.match(/^claim_name=/gm)?.length ?? 0).toBeLessThanOrEqual(32);
+      expect(Buffer.byteLength(command, "utf8")).toBeLessThanOrEqual(64 * 1024);
+    }
   });
 });

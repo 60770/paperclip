@@ -353,7 +353,8 @@ The adapter completes workspace export/restore before the heartbeat run becomes 
 remote sessions are bound to their run-scoped execution identity, and active retry references pin
 their source directories. Cleanup atomically moves each eligible UUID directory into a private
 quarantine directory before removal, so overlapping sweeps are idempotent and cannot both claim a
-live path. Failed removals are rechecked against database state on a later sweep.
+live path. Delete commands are limited to 32 directories and 64 KiB, so large backlogs are swept in
+bounded batches. Failed removals are rechecked against database state on a later sweep.
 
 Configuration:
 
