@@ -14821,7 +14821,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         if (
           options.suppressImmediateRecovery ||
           existingReviewParticipantExecutionPath ||
-          (issueHasPersistedMonitor && !isReviewParticipantRecoveryRun) ||
+          (
+            issueHasPersistedMonitor &&
+            run.status === "succeeded" &&
+            !isReviewParticipantRecoveryRun
+          ) ||
           await isAutomaticRecoverySuppressedByPauseHold(db, issue.companyId, issue.id, treeControlSvc)
         ) {
           return { kind: "released" as const };

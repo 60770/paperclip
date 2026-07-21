@@ -101,6 +101,7 @@ import {
   INTERACTION_CONTINUATION_INFRA_RETRY_REASON,
   INTERACTION_CONTINUATION_INFRA_WAKE_REASON,
   heartbeatService,
+  mergeCoalescedContextSnapshot,
   redactDetectedSuccessfulRunProgressSummaryForBoard,
 } from "../services/heartbeat.ts";
 import {
@@ -3902,6 +3903,51 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
   });
 
+  it("uses current stage metadata after a review wake is coalesced with a generic wake", async () => {
+    const { agentId, issueId, runId, wakeupRequestId, stageId } =
+      await seedInReviewParticipantRunFixture();
+    const finishedAt = new Date("2026-03-19T00:05:00.000Z");
+    await db
+      .update(heartbeatRuns)
+      .set({
+        status: "failed",
+        contextSnapshot: mergeCoalescedContextSnapshot(
+          {
+            issueId,
+            taskId: issueId,
+            wakeReason: "execution_review_requested",
+            executionStage: { stageId, stageType: "review" },
+          },
+          { issueId, taskId: issueId, wakeReason: "issue_commented" },
+        ),
+        startedAt: new Date("2026-03-19T00:00:00.000Z"),
+        finishedAt,
+        updatedAt: finishedAt,
+        errorCode: "process_lost",
+      })
+      .where(eq(heartbeatRuns.id, runId));
+    await db
+      .update(agentWakeupRequests)
+      .set({ status: "failed", finishedAt, updatedAt: finishedAt })
+      .where(eq(agentWakeupRequests.id, wakeupRequestId));
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    expect(result.reviewParticipantRequeued).toBe(1);
+    expect(result.issueIds).toEqual([issueId]);
+    const runs = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    const retryRun = runs.find((row) => row.id !== runId);
+    expect(retryRun).toMatchObject({ retryOfRunId: runId });
+    expect(retryRun?.contextSnapshot).toMatchObject({
+      currentStageId: stageId,
+      retryReason: "execution_review_participant_recovery",
+    });
+  });
+
   it("re-enqueues a successful approval participant without a durable next-check path", async () => {
     const { agentId, issueId, runId, wakeupRequestId } =
       await seedInReviewParticipantRunFixture({ stageType: "approval" });
@@ -4294,6 +4340,62 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(issue).toMatchObject({
       status: "in_review",
       assigneeAgentId: agentId,
+    });
+  });
+
+  it("recovers a failed approval participant despite a persisted monitor during finalization", async () => {
+    mockAdapterExecute.mockResolvedValueOnce({
+      exitCode: 1,
+      signal: null,
+      timedOut: false,
+      errorCode: "adapter_failed",
+      errorMessage: "Approval participant failed before recording a decision.",
+      provider: "test",
+      model: "test-model",
+    });
+    const { companyId, agentId, issueId, runId, stageId } =
+      await seedInReviewParticipantRunFixture({
+        stageType: "approval",
+        monitorNextCheckAt: new Date("2099-03-19T00:00:00.000Z"),
+      });
+    await db
+      .update(heartbeatRuns)
+      .set({
+        contextSnapshot: {
+          issueId,
+          taskId: issueId,
+          wakeReason: "execution_approval_requested",
+          executionStage: { stageId, stageType: "approval" },
+          skipIssueComment: true,
+        },
+      })
+      .where(eq(heartbeatRuns.id, runId));
+    const heartbeat = heartbeatService(db);
+
+    await heartbeat.resumeQueuedRuns();
+    const settledRun = await waitForRunToSettle(heartbeat, runId);
+    expect(settledRun?.status).toBe("failed");
+
+    const recoveryRun = await waitForValue(async () => {
+      const runs = await db
+        .select()
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.agentId, agentId));
+      return runs.find((row) =>
+        row.id !== runId &&
+          (row.contextSnapshot as Record<string, unknown> | null)?.retryReason ===
+            "execution_review_participant_recovery"
+      ) ?? null;
+    });
+
+    expect(recoveryRun).toMatchObject({
+      companyId,
+      agentId,
+      retryOfRunId: runId,
+    });
+    expect(recoveryRun?.contextSnapshot).toMatchObject({
+      issueId,
+      currentStageType: "approval",
     });
   });
 

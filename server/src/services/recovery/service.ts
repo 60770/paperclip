@@ -764,10 +764,6 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
             sql`${heartbeatRuns.contextSnapshot} -> 'executionStage' ->> 'stageId' = ${stageId}`,
             sql`${heartbeatRuns.contextSnapshot} ->> 'currentStageId' = ${stageId}`,
           ),
-          or(
-            sql`${heartbeatRuns.contextSnapshot} ->> 'wakeReason' in ('execution_review_requested', 'execution_approval_requested')`,
-            sql`${heartbeatRuns.contextSnapshot} ->> 'retryReason' = ${EXECUTION_REVIEW_PARTICIPANT_RECOVERY_REASON}`,
-          ),
         ),
       )
       .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id))
