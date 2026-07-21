@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, rename, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -76,6 +76,7 @@ function sweep(input: {
   remoteCwd: string;
   currentRunId?: string;
   states: Array<{ id: string; status: string; finishedAt: Date | null; retryOfRunId?: string | null }>;
+  executeRemoteCommand?: typeof executeLocalCommand;
 }) {
   return sweepRemoteRunRetention({
     db: {} as Db,
@@ -89,7 +90,7 @@ function sweep(input: {
     lookupRuns: async (runIds) => input.states.filter(
       (state) => runIds.includes(state.id) || (state.retryOfRunId && runIds.includes(state.retryOfRunId)),
     ),
-    executeRemoteCommand: executeLocalCommand,
+    executeRemoteCommand: input.executeRemoteCommand ?? executeLocalCommand,
   });
 }
 
@@ -177,6 +178,70 @@ describe("remote run retention", () => {
       errorCount: 0,
     });
     await expect(mkdir(path.join(runRoot, UNKNOWN_RUN_ID))).rejects.toMatchObject({ code: "EEXIST" });
+  });
+
+  it("fails closed when the runtime ancestor is a symlink outside the trusted root", async () => {
+    const remoteCwd = await mkdtemp(path.join(os.tmpdir(), "paperclip-remote-retention-"));
+    const outsideRuntime = await mkdtemp(path.join(os.tmpdir(), "paperclip-remote-retention-outside-"));
+    cleanupDirs.push(remoteCwd, outsideRuntime);
+    const outsideRunRoot = path.join(outsideRuntime, "runs");
+    const outsideRunDir = path.join(outsideRunRoot, OLD_TERMINAL_RUN_ID);
+    await mkdir(outsideRunDir, { recursive: true });
+    await writeFile(path.join(outsideRunDir, "payload.bin"), Buffer.alloc(4_096, OLD_TERMINAL_RUN_ID));
+    await symlink(outsideRuntime, path.join(remoteCwd, ".paperclip-runtime"), "dir");
+
+    const result = await sweep({
+      remoteCwd,
+      states: [
+        { id: OLD_TERMINAL_RUN_ID, status: "succeeded", finishedAt: new Date("2026-07-20T11:00:00.000Z") },
+      ],
+    });
+
+    expect(result).toMatchObject({
+      scannedCount: 0,
+      eligibleCount: 0,
+      deletedCount: 0,
+      errorCount: 1,
+    });
+    await expect(mkdir(outsideRunDir)).rejects.toMatchObject({ code: "EEXIST" });
+  });
+
+  it("fails closed when the runtime ancestor changes between probe and delete", async () => {
+    const { remoteCwd, runRoot } = await createRemoteRoot([OLD_TERMINAL_RUN_ID]);
+    const outsideRuntime = await mkdtemp(path.join(os.tmpdir(), "paperclip-remote-retention-outside-"));
+    cleanupDirs.push(outsideRuntime);
+    const outsideRunDir = path.join(outsideRuntime, "runs", OLD_TERMINAL_RUN_ID);
+    await mkdir(outsideRunDir, { recursive: true });
+    await writeFile(path.join(outsideRunDir, "payload.bin"), Buffer.alloc(4_096, OLD_TERMINAL_RUN_ID));
+    const originalRuntime = path.dirname(runRoot);
+    const displacedRuntime = path.join(remoteCwd, ".paperclip-runtime-original");
+    let commandCount = 0;
+
+    const result = await sweep({
+      remoteCwd,
+      states: [
+        { id: OLD_TERMINAL_RUN_ID, status: "succeeded", finishedAt: new Date("2026-07-20T11:00:00.000Z") },
+      ],
+      executeRemoteCommand: async (input) => {
+        commandCount += 1;
+        if (commandCount === 2) {
+          await rename(originalRuntime, displacedRuntime);
+          await symlink(outsideRuntime, originalRuntime, "dir");
+        }
+        return await executeLocalCommand(input);
+      },
+    });
+
+    expect(result).toMatchObject({
+      scannedCount: 1,
+      eligibleCount: 1,
+      deletedCount: 0,
+      errorCount: 1,
+    });
+    await expect(mkdir(outsideRunDir)).rejects.toMatchObject({ code: "EEXIST" });
+    await expect(mkdir(path.join(displacedRuntime, "runs", OLD_TERMINAL_RUN_ID))).rejects.toMatchObject({
+      code: "EEXIST",
+    });
   });
 
   it("uses atomic claims when concurrent sweeps target the same terminal run", async () => {
