@@ -2621,6 +2621,19 @@ function isExecutionReviewParticipantRecoveryEligibleRun(
   );
 }
 
+function isExecutionReviewParticipantRunForStage(
+  run: Pick<typeof heartbeatRuns.$inferSelect, "contextSnapshot"> | null,
+  stageId: string | null | undefined,
+) {
+  if (!run || !stageId) return false;
+  const context = parseObject(run.contextSnapshot);
+  const executionStage = parseObject(context.executionStage);
+  const runStageId =
+    readNonEmptyString(executionStage.stageId) ??
+    readNonEmptyString(context.currentStageId);
+  return runStageId === stageId;
+}
+
 function normalizeLedgerBillingType(value: unknown): BillingType {
   const raw = readNonEmptyString(value);
   switch (raw) {
@@ -14771,8 +14784,22 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const currentParticipant = executionState?.status === "pending"
         ? executionState.currentParticipant
         : null;
+      const recoveryHeartbeatPolicy = recoveryAgent ? parseHeartbeatPolicy(recoveryAgent) : null;
       const successfulApprovalHold =
-        executionState?.currentStageType === "approval" && run.status === "succeeded";
+        executionState?.currentStageType === "approval" &&
+        run.status === "succeeded" &&
+        isExecutionReviewParticipantRecoveryEligibleRun(run) &&
+        isExecutionReviewParticipantRunForStage(run, executionState.currentStageId) &&
+        (
+          issueHasPersistedMonitor ||
+          (
+            recoveryAgentInvokable &&
+            recoveryHeartbeatPolicy?.enabled === true &&
+            recoveryHeartbeatPolicy.intervalSec > 0 &&
+            !recoveryHeartbeatPolicy.skipTimerWhenNoActionableWork
+          ) ||
+          Boolean(await findExplicitBlockerPath())
+        );
       const issueNeedsReviewParticipantRecovery =
         issue.status === "in_review" &&
         !issue.assigneeUserId &&
@@ -14780,6 +14807,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         currentParticipant.agentId === run.agentId &&
         !successfulApprovalHold &&
         isExecutionReviewParticipantRecoveryEligibleRun(run) &&
+        isExecutionReviewParticipantRunForStage(run, executionState?.currentStageId) &&
         HEARTBEAT_RUN_TERMINAL_STATUSES.includes(
           run.status as (typeof HEARTBEAT_RUN_TERMINAL_STATUSES)[number],
         );

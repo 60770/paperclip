@@ -724,11 +724,14 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       .then((rows) => rows[0] ?? null);
   }
 
-  async function getLatestIssueRunForAgent(
+  async function getLatestExecutionReviewStageRunForAgent(
     companyId: string,
     issueId: string,
     agentId: string,
+    stageId: string | null,
   ): Promise<LatestIssueRun> {
+    if (!stageId) return null;
+
     return db
       .select({
         id: heartbeatRuns.id,
@@ -746,11 +749,34 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           eq(heartbeatRuns.companyId, companyId),
           eq(heartbeatRuns.agentId, agentId),
           sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
+          or(
+            sql`${heartbeatRuns.contextSnapshot} -> 'executionStage' ->> 'stageId' = ${stageId}`,
+            sql`${heartbeatRuns.contextSnapshot} ->> 'currentStageId' = ${stageId}`,
+          ),
+          or(
+            sql`${heartbeatRuns.contextSnapshot} ->> 'wakeReason' in ('execution_review_requested', 'execution_approval_requested')`,
+            sql`${heartbeatRuns.contextSnapshot} ->> 'retryReason' = ${EXECUTION_REVIEW_PARTICIPANT_RECOVERY_REASON}`,
+          ),
         ),
       )
       .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id))
       .limit(1)
       .then((rows) => rows[0] ?? null);
+  }
+
+  function hasEnabledTimerHeartbeat(agent: typeof agents.$inferSelect | null | undefined) {
+    const heartbeat = parseObject(parseObject(agent?.runtimeConfig).heartbeat);
+    const skipWhenNoActionableWork = asBoolean(
+      heartbeat.skipTimerWhenNoActionableWork ??
+        heartbeat.requireActionableTimerWork ??
+        heartbeat.issueOnlyTimer,
+      false,
+    );
+    return (
+      asBoolean(heartbeat.enabled, false) &&
+      asNumber(heartbeat.intervalSec, 0) > 0 &&
+      !skipWhenNoActionableWork
+    );
   }
 
   async function summarizeRecentContinuationRetries(
@@ -3547,7 +3573,12 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       }
       const recoveryNow = new Date();
       const participantLatestRunForRecovery = issue.status === "in_review" && participantAgentId
-        ? await getLatestIssueRunForAgent(issue.companyId, issue.id, participantAgentId)
+        ? await getLatestExecutionReviewStageRunForAgent(
+          issue.companyId,
+          issue.id,
+          participantAgentId,
+          pendingExecutionState?.currentStageId ?? null,
+        )
         : null;
       const providerQuotaMonitorRun = issue.status === "in_review"
         ? participantLatestRunForRecovery
@@ -3741,7 +3772,11 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
 
         if (
           pendingExecutionState.currentStageType === "approval" &&
-          participantLatestRun.status === "succeeded"
+          participantLatestRun.status === "succeeded" &&
+          (
+            (agentInvokable && hasEnabledTimerHeartbeat(agent)) ||
+            await hasPersistedDurableWaitPath(issue)
+          )
         ) {
           result.skipped += 1;
           continue;
