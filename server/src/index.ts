@@ -65,6 +65,7 @@ import { maybePersistWorktreeRuntimePorts } from "./worktree-config.js";
 import { initTelemetry, getTelemetryClient } from "./telemetry.js";
 import { conflict } from "./errors.js";
 import { coordinateHeartbeatSchedulerShutdown } from "./shutdown.js";
+import { installClientGoneSocketGuard } from "./socket-guard.js";
 import type {
   InstanceDatabaseBackupRunResult,
   InstanceDatabaseBackupTrigger,
@@ -700,6 +701,13 @@ export async function startServer(): Promise<StartedServer> {
     pluginWorkerManager,
   });
   const server = createServer(app as unknown as Parameters<typeof createServer>[0]);
+
+  // Guard against a client disconnecting mid-response (closed pipe, browser
+  // navigation, RST). Without this, an unhandled 'error' event on the
+  // client socket crashes the whole process — see socket-guard.ts / GOT-2091.
+  installClientGoneSocketGuard(server, (err) => {
+    logger.debug({ err: { code: err.code, message: err.message } }, "ignored client-gone socket error");
+  });
 
   // Increase keep-alive timeouts to safely outlive default idle timeouts
   // of common reverse proxies and load balancers (like AWS ALB, Nginx, or Traefik).
