@@ -271,6 +271,17 @@ function isTerminalIssueRun(latestRun: LatestIssueRun) {
   return TERMINAL_HEARTBEAT_RUN_STATUSES.has(latestRun.status);
 }
 
+function isTerminalAutomaticRecoveryAttempt(
+  latestRun: LatestIssueRun,
+  expectedRetryReason: typeof EXECUTION_REVIEW_PARTICIPANT_RECOVERY_REASON,
+) {
+  if (!latestRun) return false;
+
+  const latestContext = parseObject(latestRun.contextSnapshot);
+  return readNonEmptyString(latestContext.retryReason) === expectedRetryReason &&
+    isTerminalIssueRun(latestRun);
+}
+
 const TRANSIENT_INFRA_CONTINUATION_ERROR_CODES = new Set<string>([
   "adapter_failed",
   "codex_transient_upstream",
@@ -764,6 +775,23 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       .then((rows) => rows[0] ?? null);
   }
 
+  function hasPermanentHeartbeatDailyCap(agent: typeof agents.$inferSelect | null | undefined) {
+    const heartbeat = parseObject(parseObject(agent?.runtimeConfig).heartbeat);
+    const maxDailyRuns = heartbeat.maxDailyRuns ??
+      heartbeat.dailyRunLimit ??
+      heartbeat.dailyRunCap ??
+      heartbeat.maxRunsPerDay;
+    const maxDailyCostCents = heartbeat.maxDailyCostCents ??
+      heartbeat.dailyCostCentsLimit ??
+      heartbeat.dailySpendCentsLimit ??
+      heartbeat.dailyBudgetCents;
+    const isPermanentCap = (value: unknown) => {
+      if (value === null || value === undefined || value === "") return false;
+      return Math.floor(asNumber(value, 0)) === 0;
+    };
+    return isPermanentCap(maxDailyRuns) || isPermanentCap(maxDailyCostCents);
+  }
+
   function hasEnabledTimerHeartbeat(agent: typeof agents.$inferSelect | null | undefined) {
     const heartbeat = parseObject(parseObject(agent?.runtimeConfig).heartbeat);
     const skipWhenNoActionableWork = asBoolean(
@@ -775,7 +803,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return (
       asBoolean(heartbeat.enabled, false) &&
       asNumber(heartbeat.intervalSec, 0) > 0 &&
-      !skipWhenNoActionableWork
+      !skipWhenNoActionableWork &&
+      !hasPermanentHeartbeatDailyCap(agent)
     );
   }
 
@@ -3828,7 +3857,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           continue;
         }
 
-        if (!agentInvokable) {
+        if (!agentInvokable || hasPermanentHeartbeatDailyCap(agent)) {
           const updated = await escalateStrandedAssignedIssue({
             issue,
             previousStatus: "in_review",
@@ -3846,7 +3875,12 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           continue;
         }
 
-        if (didAutomaticRecoveryFail(participantLatestRun, EXECUTION_REVIEW_PARTICIPANT_RECOVERY_REASON)) {
+        if (
+          isTerminalAutomaticRecoveryAttempt(
+            participantLatestRun,
+            EXECUTION_REVIEW_PARTICIPANT_RECOVERY_REASON,
+          )
+        ) {
           const updated = await escalateStrandedAssignedIssue({
             issue,
             previousStatus: "in_review",

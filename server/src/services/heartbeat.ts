@@ -14796,7 +14796,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             recoveryAgentInvokable &&
             recoveryHeartbeatPolicy?.enabled === true &&
             recoveryHeartbeatPolicy.intervalSec > 0 &&
-            !recoveryHeartbeatPolicy.skipTimerWhenNoActionableWork
+            !recoveryHeartbeatPolicy.skipTimerWhenNoActionableWork &&
+            recoveryHeartbeatPolicy.maxDailyRuns !== 0 &&
+            recoveryHeartbeatPolicy.maxDailyCostCents !== 0
           ) ||
           Boolean(await findExplicitBlockerPath())
         );
