@@ -374,6 +374,8 @@ async function createSshAuthArgs(
     "-o",
     "BatchMode=yes",
     "-o",
+    "IdentitiesOnly=yes",
+    "-o",
     "ConnectTimeout=10",
     "-o",
     `StrictHostKeyChecking=${config.strictHostKeyChecking ? "yes" : "no"}`,

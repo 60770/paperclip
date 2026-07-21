@@ -192,6 +192,34 @@ describe("ssh env-lab fixture", () => {
     ).rejects.toThrow("Invalid SSH environment variable key: BAD KEY");
   });
 
+  it("limits SSH authentication to the configured private key", async () => {
+    const target = await buildSshSpawnTarget({
+      spec: {
+        host: "ssh.example.test",
+        port: 22,
+        username: "ssh-user",
+        remoteCwd: "/srv/paperclip/workspace",
+        remoteWorkspacePath: "/srv/paperclip/workspace",
+        privateKey: "test-private-key",
+        knownHosts: null,
+        strictHostKeyChecking: true,
+      },
+      command: "env",
+      args: [],
+      env: {},
+    });
+
+    try {
+      expect(target.args).toEqual(expect.arrayContaining([
+        "-o",
+        "IdentitiesOnly=yes",
+        "-i",
+      ]));
+    } finally {
+      await target.cleanup();
+    }
+  });
+
   it("syncs a local directory into the remote fixture workspace", async () => {
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-fixture-"));
     cleanupDirs.push(rootDir);
