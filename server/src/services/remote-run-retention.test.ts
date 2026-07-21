@@ -80,6 +80,9 @@ function sweep(input: {
   remoteCwd: string;
   currentRunId?: string;
   states: Array<{ id: string; status: string; finishedAt: Date | null; retryOfRunId?: string | null }>;
+  lookupRuns?: (runIds: string[]) => Promise<
+    Array<{ id: string; status: string; finishedAt: Date | null; retryOfRunId?: string | null }>
+  >;
   executeRemoteCommand?: typeof executeLocalCommand;
 }) {
   return sweepRemoteRunRetention({
@@ -91,9 +94,9 @@ function sweep(input: {
       PAPERCLIP_REMOTE_RUN_DISK_WARNING_PERCENT: "99",
     },
     now: NOW,
-    lookupRuns: async (runIds) => input.states.filter(
+    lookupRuns: input.lookupRuns ?? (async (runIds) => input.states.filter(
       (state) => runIds.includes(state.id) || (state.retryOfRunId && runIds.includes(state.retryOfRunId)),
-    ),
+    )),
     executeRemoteCommand: input.executeRemoteCommand ?? executeLocalCommand,
   });
 }
@@ -157,6 +160,47 @@ describe("remote run retention", () => {
           retryOfRunId: OLD_TERMINAL_RUN_ID,
         },
       ],
+    });
+
+    expect(result).toMatchObject({
+      scannedCount: 1,
+      eligibleCount: 0,
+      deletedCount: 0,
+      skippedActiveCount: 1,
+      errorCount: 0,
+    });
+    await expect(mkdir(path.join(runRoot, OLD_TERMINAL_RUN_ID))).rejects.toMatchObject({ code: "EEXIST" });
+  });
+
+  it("keeps a terminal run when a retry becomes active after the first state lookup", async () => {
+    const { remoteCwd, runRoot } = await createRemoteRoot([OLD_TERMINAL_RUN_ID]);
+    const states: Array<{
+      id: string;
+      status: string;
+      finishedAt: Date | null;
+      retryOfRunId?: string | null;
+    }> = [
+      { id: OLD_TERMINAL_RUN_ID, status: "failed", finishedAt: new Date("2026-07-20T11:00:00.000Z") },
+    ];
+    let lookupCount = 0;
+
+    const result = await sweep({
+      remoteCwd,
+      states,
+      lookupRuns: async (runIds) => {
+        lookupCount += 1;
+        if (lookupCount === 2) {
+          states.push({
+            id: RETRY_RUN_ID,
+            status: "scheduled_retry",
+            finishedAt: null,
+            retryOfRunId: OLD_TERMINAL_RUN_ID,
+          });
+        }
+        return states.filter(
+          (state) => runIds.includes(state.id) || (state.retryOfRunId && runIds.includes(state.retryOfRunId)),
+        );
+      },
     });
 
     expect(result).toMatchObject({

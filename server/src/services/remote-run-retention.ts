@@ -5,7 +5,7 @@ import {
   runAdapterExecutionTargetShellCommand,
   type AdapterExecutionTarget,
 } from "@paperclipai/adapter-utils/execution-target";
-import { and, inArray, or } from "drizzle-orm";
+import { and, asc, inArray, isNull, or } from "drizzle-orm";
 import { logger } from "../middleware/logger.js";
 
 export const DEFAULT_REMOTE_RUN_RETENTION_HOURS = 24;
@@ -72,6 +72,8 @@ type RemoteCommandExecutor = (input: {
 }) => Promise<RemoteCommandResult>;
 
 type RemoteRunLookup = (runIds: string[]) => Promise<RemoteRunState[]>;
+
+type RemoteRunClaim = (runIds: string[]) => Promise<RemoteRunState[]>;
 
 function shellQuote(value: string) {
   return `'${value.replace(/'/g, `'"'"'`)}'`;
@@ -403,6 +405,37 @@ function parseDeleteOutput(stdout: string) {
   return { deletedCount, bytesFreed, errorCount, diskUsedPercent };
 }
 
+function classifyRunForRetention(input: {
+  runId: string;
+  currentRunId: string;
+  stateById: Map<string, RemoteRunState>;
+  activeRetryParents: Set<string>;
+  cutoff: number;
+}) {
+  if (input.runId === input.currentRunId || input.activeRetryParents.has(input.runId)) {
+    return "active" as const;
+  }
+  const state = input.stateById.get(input.runId);
+  if (!state || !TERMINAL_RUN_STATUSES.has(state.status) || !state.finishedAt) {
+    return state && ACTIVE_RUN_STATUSES.has(state.status) ? "active" as const : "unverifiable" as const;
+  }
+  const finishedAt = state.finishedAt.getTime();
+  if (!Number.isFinite(finishedAt)) return "unverifiable" as const;
+  if (finishedAt > input.cutoff) return "recent" as const;
+  return "eligible" as const;
+}
+
+function indexRunStates(states: RemoteRunState[]) {
+  return {
+    stateById: new Map(states.map((state) => [state.id, state])),
+    activeRetryParents: new Set(
+      states
+        .filter((state) => state.retryOfRunId && ACTIVE_RUN_STATUSES.has(state.status))
+        .map((state) => state.retryOfRunId!),
+    ),
+  };
+}
+
 async function defaultExecuteRemoteCommand(input: {
   currentRunId: string;
   target: AdapterExecutionTarget;
@@ -426,6 +459,7 @@ export async function sweepRemoteRunRetention(input: {
   env?: Record<string, string | undefined>;
   now?: Date;
   lookupRuns?: RemoteRunLookup;
+  claimRuns?: RemoteRunClaim;
   executeRemoteCommand?: RemoteCommandExecutor;
 }): Promise<RemoteRunRetentionResult> {
   const config = resolveRemoteRunRetentionConfig(input.env);
@@ -442,6 +476,8 @@ export async function sweepRemoteRunRetention(input: {
   }
   const diskPath = runRoot.slice(0, -"/.paperclip-runtime/runs".length) || "/";
   const result = emptyResult(config, runRoot, true);
+  const now = input.now ?? new Date();
+  const cutoff = now.getTime() - config.retentionHours * 60 * 60 * 1_000;
   const executeRemoteCommand = input.executeRemoteCommand ?? ((commandInput) => defaultExecuteRemoteCommand({
     currentRunId: input.currentRunId,
     ...commandInput,
@@ -500,6 +536,65 @@ export async function sweepRemoteRunRetention(input: {
         ),
       );
   });
+  const claimRuns = input.claimRuns ?? (input.lookupRuns
+    ? lookupRuns
+    : async (ids: string[]) => {
+        if (ids.length === 0) return [];
+        return await input.db.transaction(async (tx) => {
+          const lockedRuns = await tx
+            .select({
+              id: heartbeatRuns.id,
+              status: heartbeatRuns.status,
+              finishedAt: heartbeatRuns.finishedAt,
+              retryOfRunId: heartbeatRuns.retryOfRunId,
+            })
+            .from(heartbeatRuns)
+            .where(inArray(heartbeatRuns.id, ids))
+            .orderBy(asc(heartbeatRuns.id))
+            .for("update");
+          const activeRetries = await tx
+            .select({
+              id: heartbeatRuns.id,
+              status: heartbeatRuns.status,
+              finishedAt: heartbeatRuns.finishedAt,
+              retryOfRunId: heartbeatRuns.retryOfRunId,
+            })
+            .from(heartbeatRuns)
+            .where(
+              and(
+                inArray(heartbeatRuns.retryOfRunId, ids),
+                inArray(heartbeatRuns.status, [...ACTIVE_RUN_STATUSES]),
+              ),
+            );
+          const states = [...lockedRuns, ...activeRetries];
+          const { stateById, activeRetryParents } = indexRunStates(states);
+          const claimableRunIds = lockedRuns
+            .filter((state) => classifyRunForRetention({
+              runId: state.id,
+              currentRunId: input.currentRunId,
+              stateById,
+              activeRetryParents,
+              cutoff,
+            }) === "eligible")
+            .map((state) => state.id);
+          if (claimableRunIds.length > 0) {
+            await tx
+              .update(heartbeatRuns)
+              .set({
+                remoteRetentionClaimedAt: now,
+                remoteRetentionClaimedByRunId: input.currentRunId,
+                updatedAt: now,
+              })
+              .where(
+                and(
+                  inArray(heartbeatRuns.id, claimableRunIds),
+                  isNull(heartbeatRuns.remoteRetentionClaimedAt),
+                ),
+              );
+          }
+          return states;
+        });
+      });
 
   let states: RemoteRunState[];
   try {
@@ -512,38 +607,66 @@ export async function sweepRemoteRunRetention(input: {
     return result;
   }
 
-  const stateById = new Map(states.map((state) => [state.id, state]));
-  const activeRetryParents = new Set(
-    states
-      .filter((state) => state.retryOfRunId && ACTIVE_RUN_STATUSES.has(state.status))
-      .map((state) => state.retryOfRunId!),
-  );
-  const cutoff = (input.now ?? new Date()).getTime() - config.retentionHours * 60 * 60 * 1_000;
-  const eligible: RemoteRunDirectory[] = [];
+  const { stateById, activeRetryParents } = indexRunStates(states);
+  const candidates: RemoteRunDirectory[] = [];
   for (const directory of parsedProbe.directories) {
-    if (directory.runId === input.currentRunId || activeRetryParents.has(directory.runId)) {
-      result.skippedActiveCount += 1;
-      continue;
-    }
-    const state = stateById.get(directory.runId);
-    if (!state || !TERMINAL_RUN_STATUSES.has(state.status) || !state.finishedAt) {
-      if (state && ACTIVE_RUN_STATUSES.has(state.status)) {
+    switch (classifyRunForRetention({
+      runId: directory.runId,
+      currentRunId: input.currentRunId,
+      stateById,
+      activeRetryParents,
+      cutoff,
+    })) {
+      case "active":
         result.skippedActiveCount += 1;
-      } else {
+        break;
+      case "unverifiable":
         result.skippedUnverifiableCount += 1;
+        break;
+      case "recent":
+        result.skippedRecentTerminalCount += 1;
+        break;
+      case "eligible":
+        candidates.push(directory);
+        break;
+    }
+  }
+
+  let eligible: RemoteRunDirectory[] = [];
+  if (candidates.length > 0) {
+    let claimedStates: RemoteRunState[];
+    try {
+      claimedStates = await claimRuns([...new Set(candidates.map((directory) => directory.runId))]);
+    } catch (error) {
+      result.errorCount += 1;
+      result.skippedUnverifiableCount += candidates.length;
+      result.diskWarning = result.diskUsedPercent !== null && result.diskUsedPercent >= config.diskWarningPercent;
+      logger.warn({ err: error, ...result, runId: input.currentRunId }, "remote run retention claim failed");
+      return result;
+    }
+    const claimedIndex = indexRunStates(claimedStates);
+    for (const directory of candidates) {
+      switch (classifyRunForRetention({
+        runId: directory.runId,
+        currentRunId: input.currentRunId,
+        stateById: claimedIndex.stateById,
+        activeRetryParents: claimedIndex.activeRetryParents,
+        cutoff,
+      })) {
+        case "active":
+          result.skippedActiveCount += 1;
+          break;
+        case "unverifiable":
+          result.skippedUnverifiableCount += 1;
+          break;
+        case "recent":
+          result.skippedRecentTerminalCount += 1;
+          break;
+        case "eligible":
+          eligible.push(directory);
+          break;
       }
-      continue;
     }
-    const finishedAt = state.finishedAt.getTime();
-    if (!Number.isFinite(finishedAt)) {
-      result.skippedUnverifiableCount += 1;
-      continue;
-    }
-    if (finishedAt > cutoff) {
-      result.skippedRecentTerminalCount += 1;
-      continue;
-    }
-    eligible.push(directory);
   }
   result.eligibleCount = eligible.length;
 

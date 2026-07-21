@@ -42,6 +42,8 @@ export const heartbeatRuns = pgTable(
     retryOfRunId: uuid("retry_of_run_id").references((): AnyPgColumn => heartbeatRuns.id, {
       onDelete: "set null",
     }),
+    remoteRetentionClaimedAt: timestamp("remote_retention_claimed_at", { withTimezone: true }),
+    remoteRetentionClaimedByRunId: uuid("remote_retention_claimed_by_run_id"),
     processLossRetryCount: integer("process_loss_retry_count").notNull().default(0),
     scheduledRetryAt: timestamp("scheduled_retry_at", { withTimezone: true }),
     scheduledRetryAttempt: integer("scheduled_retry_attempt").notNull().default(0),
