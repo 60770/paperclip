@@ -247,13 +247,12 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     await db.delete(activityLog);
     await db.delete(issueRecoveryActions);
     await db.delete(issueComments);
+    await db.delete(heartbeatRuns);
     await db.delete(issues);
     await db.delete(agents);
     await db.delete(executionWorkspaces);
     await db.delete(projectWorkspaces);
     await db.delete(projects);
-    await db.delete(heartbeatRuns);
-    await db.delete(agents);
     await db.delete(instanceSettings);
     await db.delete(companies);
 

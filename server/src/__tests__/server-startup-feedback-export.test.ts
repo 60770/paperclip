@@ -14,6 +14,8 @@ const {
   deriveAuthTrustedOriginsMock,
   environmentCustomImagesServiceMock,
   environmentCustomImagesServiceFactoryMock,
+  executionWorkspacesServiceFactoryMock,
+  executionWorkspacesServiceMock,
   feedbackExportServiceMock,
   feedbackServiceFactoryMock,
   fakeServer,
@@ -64,6 +66,10 @@ const {
     cleanupExpiredSetupSessions: vi.fn(async () => ({ scanned: 0, timedOut: 0, failed: 0 })),
   };
   const environmentCustomImagesServiceFactoryMock = vi.fn(() => environmentCustomImagesServiceMock);
+  const executionWorkspacesServiceMock = {
+    archiveTerminalSharedLocalWorkspaces: vi.fn(async () => ({ archived: 0 })),
+  };
+  const executionWorkspacesServiceFactoryMock = vi.fn(() => executionWorkspacesServiceMock);
   const routineServiceMock = {
     tickScheduledTriggers: vi.fn(async () => ({ triggered: 0 })),
   };
@@ -91,6 +97,8 @@ const {
     deriveAuthTrustedOriginsMock,
     environmentCustomImagesServiceMock,
     environmentCustomImagesServiceFactoryMock,
+    executionWorkspacesServiceFactoryMock,
+    executionWorkspacesServiceMock,
     feedbackExportServiceMock,
     feedbackServiceFactoryMock,
     fakeServer,
@@ -207,6 +215,7 @@ vi.mock("../services/index.js", () => ({
   feedbackService: feedbackServiceFactoryMock,
   bootstrapExecutionPolicyFromEnv: vi.fn(async () => null),
   environmentCustomImageService: environmentCustomImagesServiceFactoryMock,
+  executionWorkspaceService: executionWorkspacesServiceFactoryMock,
   heartbeatService: heartbeatServiceFactoryMock,
   instanceSettingsService: vi.fn(() => ({
     getGeneral: vi.fn(async () => ({
@@ -313,12 +322,12 @@ describe("startServer feedback export wiring", () => {
       suppressed: true,
       reason: "worktree_instance",
     });
-    let intervalCallback: (() => void) | null = null;
+    const intervalCallbacks: Array<{ callback: () => void; delayMs: number | undefined }> = [];
     const setIntervalSpy = vi
       .spyOn(globalThis, "setInterval")
-      .mockImplementation(((callback: () => void) => {
-        intervalCallback = callback;
-        return 1 as unknown as ReturnType<typeof setInterval>;
+      .mockImplementation(((callback: () => void, delayMs?: number) => {
+        intervalCallbacks.push({ callback, delayMs });
+        return intervalCallbacks.length as unknown as ReturnType<typeof setInterval>;
       }) as typeof setInterval);
 
     try {
@@ -327,9 +336,11 @@ describe("startServer feedback export wiring", () => {
       expect(heartbeatServiceMock.reapOrphanedRuns).not.toHaveBeenCalled();
       expect(heartbeatServiceMock.tickTimers).not.toHaveBeenCalled();
       expect(environmentCustomImagesServiceMock.cleanupExpiredSetupSessions).toHaveBeenCalledTimes(1);
+      expect(executionWorkspacesServiceMock.archiveTerminalSharedLocalWorkspaces).toHaveBeenCalledTimes(1);
 
-      expect(intervalCallback).not.toBeNull();
-      intervalCallback?.();
+      const schedulerTick = intervalCallbacks.find((entry) => entry.delayMs === 30000)?.callback ?? null;
+      expect(schedulerTick).not.toBeNull();
+      schedulerTick?.();
       await Promise.resolve();
       await Promise.resolve();
 
