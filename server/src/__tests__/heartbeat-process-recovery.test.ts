@@ -3770,6 +3770,49 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(retryRun?.contextSnapshot as Record<string, unknown>).not.toHaveProperty("modelProfile");
   });
 
+  it("does not re-enqueue a successful review participant with a monitor", async () => {
+    const { agentId, issueId, runId, wakeupRequestId } =
+      await seedInReviewParticipantRunFixture({
+        monitorNextCheckAt: new Date("2099-03-19T00:00:00.000Z"),
+      });
+    const finishedAt = new Date("2026-03-19T00:05:00.000Z");
+    await db
+      .update(heartbeatRuns)
+      .set({
+        status: "succeeded",
+        startedAt: new Date("2026-03-19T00:00:00.000Z"),
+        finishedAt,
+        updatedAt: finishedAt,
+      })
+      .where(eq(heartbeatRuns.id, runId));
+    await db
+      .update(agentWakeupRequests)
+      .set({ status: "completed", finishedAt, updatedAt: finishedAt })
+      .where(eq(agentWakeupRequests.id, wakeupRequestId));
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    expect(result.reviewParticipantRequeued).toBe(0);
+    expect(result.escalated).toBe(0);
+    expect(result.issueIds).toEqual([]);
+    const runs = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    expect(runs).toHaveLength(1);
+    const issue = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(issue).toMatchObject({
+      status: "in_review",
+      assigneeAgentId: agentId,
+      monitorNextCheckAt: new Date("2099-03-19T00:00:00.000Z"),
+    });
+  });
+
   it("does not re-enqueue a successful approval participant holding an asynchronous gate", async () => {
     const { agentId, issueId, runId, wakeupRequestId } =
       await seedInReviewParticipantRunFixture({

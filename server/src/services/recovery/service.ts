@@ -3596,15 +3596,6 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       }
 
       let latestRun = await getLatestIssueRun(issue.companyId, issue.id);
-      if (
-        issue.status !== "in_review" &&
-        latestRun?.status === "succeeded" &&
-        await hasPersistedDurableWaitPath(issue)
-      ) {
-        result.skipped += 1;
-        continue;
-      }
-      const recoveryNow = new Date();
       const participantLatestRunForRecovery = issue.status === "in_review" && participantAgentId
         ? await getLatestExecutionReviewStageRunForAgent(
           issue.companyId,
@@ -3613,6 +3604,18 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           pendingExecutionState?.currentStageId ?? null,
         )
         : null;
+      const successfulRunWithDurableWait = issue.status === "in_review"
+        ? participantLatestRunForRecovery?.status === "succeeded" &&
+          !isTerminalAutomaticRecoveryAttempt(
+            participantLatestRunForRecovery,
+            EXECUTION_REVIEW_PARTICIPANT_RECOVERY_REASON,
+          )
+        : latestRun?.status === "succeeded";
+      if (successfulRunWithDurableWait && await hasPersistedDurableWaitPath(issue)) {
+        result.skipped += 1;
+        continue;
+      }
+      const recoveryNow = new Date();
       const providerQuotaMonitorRun = issue.status === "in_review"
         ? participantLatestRunForRecovery
         : latestRun;
