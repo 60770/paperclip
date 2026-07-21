@@ -14771,11 +14771,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const currentParticipant = executionState?.status === "pending"
         ? executionState.currentParticipant
         : null;
+      const successfulApprovalHold =
+        executionState?.currentStageType === "approval" && run.status === "succeeded";
       const issueNeedsReviewParticipantRecovery =
         issue.status === "in_review" &&
         !issue.assigneeUserId &&
         currentParticipant?.type === "agent" &&
         currentParticipant.agentId === run.agentId &&
+        !successfulApprovalHold &&
         isExecutionReviewParticipantRecoveryEligibleRun(run) &&
         HEARTBEAT_RUN_TERMINAL_STATUSES.includes(
           run.status as (typeof HEARTBEAT_RUN_TERMINAL_STATUSES)[number],

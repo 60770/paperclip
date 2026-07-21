@@ -3739,6 +3739,14 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           continue;
         }
 
+        if (
+          pendingExecutionState.currentStageType === "approval" &&
+          participantLatestRun.status === "succeeded"
+        ) {
+          result.skipped += 1;
+          continue;
+        }
+
         const participantAdapterFailureClassification = isUnsuccessfulTerminalIssueRun(participantLatestRun)
           ? classifyAdapterFailureForRecovery(participantLatestRun, recoveryNow)
           : null;

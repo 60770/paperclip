@@ -795,6 +795,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
   async function seedInReviewParticipantRunFixture(input?: {
     wakeReason?: string;
     retryReason?: string | null;
+    stageType?: "review" | "approval";
   }) {
     const companyId = randomUUID();
     const agentId = randomUUID();
@@ -805,6 +806,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     const now = new Date("2026-03-19T00:00:00.000Z");
     const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
     const wakeReason = input?.wakeReason ?? "execution_review_requested";
+    const stageType = input?.stageType ?? "review";
 
     await db.insert(companies).values({
       id: companyId,
@@ -878,7 +880,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         status: "pending",
         currentStageId: stageId,
         currentStageIndex: 0,
-        currentStageType: "review",
+        currentStageType: stageType,
         currentParticipant: { type: "agent", agentId, userId: null },
         returnAssignee: { type: "agent", agentId, userId: null },
         reviewRequest: null,
@@ -3726,6 +3728,92 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(retryRun?.contextSnapshot as Record<string, unknown>).not.toHaveProperty("modelProfile");
   });
 
+  it("does not re-enqueue a successful approval participant holding an asynchronous gate", async () => {
+    const { agentId, issueId, runId, wakeupRequestId } =
+      await seedInReviewParticipantRunFixture({ stageType: "approval" });
+    const finishedAt = new Date("2026-03-19T00:05:00.000Z");
+    await db
+      .update(heartbeatRuns)
+      .set({
+        status: "succeeded",
+        startedAt: new Date("2026-03-19T00:00:00.000Z"),
+        finishedAt,
+        updatedAt: finishedAt,
+      })
+      .where(eq(heartbeatRuns.id, runId));
+    await db
+      .update(agentWakeupRequests)
+      .set({
+        status: "completed",
+        finishedAt,
+        updatedAt: finishedAt,
+      })
+      .where(eq(agentWakeupRequests.id, wakeupRequestId));
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    expect(result.reviewParticipantRequeued).toBe(0);
+    expect(result.escalated).toBe(0);
+    expect(result.issueIds).toEqual([]);
+    const runs = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    expect(runs).toHaveLength(1);
+    const issue = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(issue).toMatchObject({
+      status: "in_review",
+      assigneeAgentId: agentId,
+    });
+  });
+
+  it("still re-enqueues a failed approval participant", async () => {
+    const { agentId, issueId, runId, wakeupRequestId } =
+      await seedInReviewParticipantRunFixture({ stageType: "approval" });
+    const finishedAt = new Date("2026-03-19T00:05:00.000Z");
+    await db
+      .update(heartbeatRuns)
+      .set({
+        status: "failed",
+        startedAt: new Date("2026-03-19T00:00:00.000Z"),
+        finishedAt,
+        updatedAt: finishedAt,
+        errorCode: "process_lost",
+        error: "approval participant process exited unexpectedly",
+      })
+      .where(eq(heartbeatRuns.id, runId));
+    await db
+      .update(agentWakeupRequests)
+      .set({
+        status: "failed",
+        finishedAt,
+        updatedAt: finishedAt,
+      })
+      .where(eq(agentWakeupRequests.id, wakeupRequestId));
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    expect(result.reviewParticipantRequeued).toBe(1);
+    expect(result.escalated).toBe(0);
+    expect(result.issueIds).toEqual([issueId]);
+    const runs = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    const retryRun = runs.find((row) => row.id !== runId);
+    expect(retryRun?.contextSnapshot).toMatchObject({
+      issueId,
+      retryReason: "execution_review_participant_recovery",
+      currentStageType: "approval",
+    });
+  });
+
   it("re-enqueues a stranded execution-review participant when another agent has the latest issue run", async () => {
     const { companyId, agentId, issueId, runId, wakeupRequestId, stageId } =
       await seedInReviewParticipantRunFixture();
@@ -3947,6 +4035,36 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .then((rows) => rows[0] ?? null);
     expect(issue?.status).toBe("in_review");
     expect(issue?.assigneeAgentId).toBe(agentId);
+  });
+
+  it("does not immediately recover a successful approval participant holding an asynchronous gate", async () => {
+    const { agentId, issueId, runId } = await seedInReviewParticipantRunFixture({
+      stageType: "approval",
+    });
+    const heartbeat = heartbeatService(db);
+
+    await heartbeat.resumeQueuedRuns();
+    const settledRun = await waitForRunToSettle(heartbeat, runId, 8_000);
+    expect(settledRun?.status).toBe("succeeded");
+
+    const runs = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    expect(runs).toHaveLength(1);
+    expect(runs.some((row) =>
+      (row.contextSnapshot as Record<string, unknown> | null)?.retryReason ===
+        "execution_review_participant_recovery"
+    )).toBe(false);
+    const issue = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(issue).toMatchObject({
+      status: "in_review",
+      assigneeAgentId: agentId,
+    });
   });
 
   it("retries a pending execution-review participant once before blocking with a recovery action", async () => {
