@@ -337,6 +337,37 @@ Agent, project, environment, secret, skill, and workspace config edits are sampl
 
 When effective run config changes, Paperclip may intentionally skip a saved adapter session, refresh persisted workspace runtime config, replace a reused execution workspace, or avoid reusing a sandbox/environment lease. Fresh execution can lose adapter-specific session, workspace, or sandbox state; correctness of the next run's config takes priority over continuity. Plain environment values affect freshness through value hashes; run result JSON and workspace operation logs expose only the non-sensitive freshness decision categories, without storing secret values, full env maps, provider credentials, or private path details.
 
+## Remote Run Directory Retention
+
+Before starting an SSH or sandbox/Warden-backed adapter run, Paperclip sweeps the target's
+`.paperclip-runtime/runs/<runId>` directories. The default retention window is 24 hours after
+`heartbeat_runs.finished_at`. Only runs whose database state is terminal (`succeeded`,
+`interrupted`, `failed`, `cancelled`, or `timed_out`) and older than that window are eligible.
+`queued`, `scheduled_retry`, and `running` runs are always retained. Missing rows, unknown states,
+missing or invalid completion times, symlinks, and state lookup failures are retained fail-closed.
+A terminal run referenced by a queued, scheduled, or running retry is also retained until that retry
+becomes terminal.
+
+The adapter completes workspace export/restore before the heartbeat run becomes terminal. The
+24-hour grace period therefore preserves immediate diagnostics while bounding tmpfs growth. Saved
+remote sessions are bound to their run-scoped execution identity, and active retry references pin
+their source directories. Cleanup atomically moves each eligible UUID directory into a private
+quarantine directory before removal, so overlapping sweeps are idempotent and cannot both claim a
+live path. Failed removals are rechecked against database state on a later sweep.
+
+Configuration:
+
+- `PAPERCLIP_REMOTE_RUN_RETENTION_HOURS=<hours>`: non-negative integer; default `24`. Set to `0` to disable pruning.
+- `PAPERCLIP_REMOTE_RUN_DISK_WARNING_PERCENT=<1-99>`: emit a structured warning when the remote filesystem reaches this utilization; default `85`.
+
+Every sweep that frees space logs `deletedCount`, `bytesFreed`, and `errorCount`. A warning also
+includes remote disk utilization when it crosses the configured threshold or when any probe,
+state lookup, or deletion error occurs.
+
+Rollback: set `PAPERCLIP_REMOTE_RUN_RETENTION_HOURS=0` and restart Paperclip. This stops future
+deletions without changing adapter execution. Already-pruned remote directories are not restored;
+the persisted heartbeat logs and source/execution worktree remain the recovery sources.
+
 ## Worktree-local Instances
 
 When developing from multiple git worktrees, do not point two Paperclip servers at the same embedded PostgreSQL data directory.
