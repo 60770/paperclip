@@ -17014,7 +17014,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             .where(and(
               eq(issues.companyId, agent.companyId),
               eq(issues.assigneeAgentId, agent.id),
-              inArray(issues.status, ["todo", "in_progress"]),
+              inArray(issues.status, ["todo", "in_progress", "in_review"]),
               gte(issues.createdAt, cutoff),
             ))
             .limit(1)
