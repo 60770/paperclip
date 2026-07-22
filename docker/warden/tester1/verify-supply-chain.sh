@@ -42,6 +42,10 @@ grep -Eq -- '--prefix /opt/runner-tools' "${DOCKERFILE}" \
   || fail "npm ci must install the locked runner toolchain under /opt/runner-tools."
 grep -Eq '/opt/runner-tools/node_modules/\.bin' "${DOCKERFILE}" \
   || fail "Locked npm executables are missing from PATH."
+grep -Fq 'ln -s /opt/runner-tools/node_modules/.bin/codex /usr/local/bin/codex' "${DOCKERFILE}" \
+  || fail "The pinned Codex executable must be installed at the wrapper path."
+grep -Fq 'ln -s /opt/runner-tools/node_modules/.bin/playwright-mcp /usr/local/bin/playwright-mcp' "${DOCKERFILE}" \
+  || fail "The pinned Playwright MCP executable must be installed at the smoke-test path."
 grep -Eq 'rm -rf /usr/local/lib/node_modules/npm' "${DOCKERFILE}" \
   || fail "The npm package manager must not remain in the runtime image."
 if grep -Eq 'npm[[:space:]]+(install|i)([[:space:]]|\\)' "${DOCKERFILE}"; then
@@ -72,6 +76,8 @@ jq -e --slurpfile package "${PACKAGE_JSON}" '
   .lockfileVersion == 3 and
   .packages[""].dependencies == $package[0].dependencies and
   ($package[0].private == true) and
+  .packages["node_modules/@openai/codex"].bin.codex == "bin/codex.js" and
+  .packages["node_modules/@playwright/mcp"].bin["playwright-mcp"] == "cli.js" and
   ([$package[0].dependencies[] | test("^[0-9]+\\.[0-9]+\\.[0-9]+([+-].*)?$")] | all) and
   ([.packages | to_entries[] | select(.key != "") | .value | select(.resolved != null) | has("integrity")] | all)
 ' "${PACKAGE_LOCK}" >/dev/null || fail "package-lock.json is incomplete or inconsistent with package.json."

@@ -58,6 +58,28 @@ prepare_live() {
     "${TEMP_ROOT}/docker-rendered"
 }
 
+write_runtime_fingerprints() {
+  local manifest_path="$1"
+  local relative_path
+  local runtime_mode
+  local runtime_uid
+  : >"${manifest_path}"
+  chmod 0600 "${manifest_path}"
+  for relative_path in \
+    .env \
+    .warden/runner/authorized_keys \
+    .warden/runner/ssh_host_ed25519_key \
+    .warden/runner/ssh_host_ed25519_key.pub; do
+    runtime_mode="$(stat -c '%a' "${TEMP_ROOT}/live/${relative_path}")"
+    runtime_uid="$(stat -c '%u' "${TEMP_ROOT}/live/${relative_path}")"
+    printf '%s 0%s %s %s\n' \
+      "$(sha256sum "${TEMP_ROOT}/live/${relative_path}" | awk '{print $1}')" \
+      "${runtime_mode}" \
+      "${runtime_uid}" \
+      "${relative_path}" >>"${manifest_path}"
+  done
+}
+
 cat <<'SH' >"${TEMP_ROOT}/fake-docker"
 #!/usr/bin/env bash
 set -euo pipefail
@@ -322,6 +344,17 @@ printf 'PASS: operational rebuild requires the installed privileged boundary.\n'
 
 prepare_live
 snapshot_dir="${TEMP_ROOT}/snapshot"
+runtime_fingerprints="${TEMP_ROOT}/runtime-fingerprints.expected"
+write_runtime_fingerprints "${runtime_fingerprints}"
+printf '\n# replace object mutation\n' >>"${canonical_dir}/.warden/runner/Dockerfile"
+git -C "${TEMP_ROOT}/repo" add docker/warden/tester1/.warden/runner/Dockerfile
+git -C "${TEMP_ROOT}/repo" \
+  -c user.name='Attestation Test' \
+  -c user.email='attestation-test@example.invalid' \
+  commit -qm 'replacement fixture'
+replacement_commit="$(git -C "${TEMP_ROOT}/repo" rev-parse HEAD)"
+git --no-replace-objects -C "${TEMP_ROOT}/repo" replace "${fixture_commit}" "${replacement_commit}"
+git --no-replace-objects -C "${TEMP_ROOT}/repo" reset --hard -q "${fixture_commit}"
 mkdir -m 0700 "${snapshot_dir}"
 "${canonical_dir}/materialize-attested-snapshot.py" \
   --git-bin /usr/bin/git \
@@ -330,9 +363,14 @@ mkdir -m 0700 "${snapshot_dir}"
   --source-path docker/warden/tester1 \
   --live-dir "${TEMP_ROOT}/live" \
   --snapshot-dir "${snapshot_dir}" \
+  --runtime-fingerprints "${runtime_fingerprints}" \
   --fingerprint-output "${TEMP_ROOT}/runtime-fingerprints.sha256"
 [[ "$(wc -l <"${TEMP_ROOT}/runtime-fingerprints.sha256")" == 4 ]] \
   || fail "Runtime fingerprint inventory is incomplete."
+if grep -q 'replace object mutation' "${snapshot_dir}/.warden/runner/Dockerfile"; then
+  fail "Snapshot materialization honored a Git replace object."
+fi
+printf 'PASS: Git replace objects cannot alter the selected commit tree.\n'
 env "${run_env[@]}" \
   "${snapshot_dir}/verify-attestation.sh" --snapshot-dir "${snapshot_dir}" >/dev/null
 
@@ -369,6 +407,48 @@ snapshot_build_sha256="$(tr -d '[:space:]' <"${TEMP_ROOT}/snapshot-build-context
 printf 'PASS: concurrent live mutation+restore cannot change the snapshot build context.\n'
 
 prepare_live
+stale_runtime_fingerprints="${TEMP_ROOT}/stale-runtime-fingerprints.expected"
+write_runtime_fingerprints "${stale_runtime_fingerprints}"
+printf '\n# stable pre-open mutation\n' >>"${TEMP_ROOT}/live/.env"
+mkdir -m 0700 "${TEMP_ROOT}/stale-fingerprint-snapshot"
+if output="$("${canonical_dir}/materialize-attested-snapshot.py" \
+  --git-bin /usr/bin/git \
+  --repo-dir "${TEMP_ROOT}/repo" \
+  --commit "${fixture_commit}" \
+  --source-path docker/warden/tester1 \
+  --live-dir "${TEMP_ROOT}/live" \
+  --snapshot-dir "${TEMP_ROOT}/stale-fingerprint-snapshot" \
+  --runtime-fingerprints "${stale_runtime_fingerprints}" \
+  --fingerprint-output "${TEMP_ROOT}/stale-fingerprints" 2>&1)"; then
+  fail "Snapshot accepted runtime content that differed from the custodied fingerprint."
+fi
+grep -q 'Runtime file digest differs from the custodied fingerprint: .env' <<<"${output}" \
+  || fail "Runtime digest mismatch failed for an unexpected reason: ${output}"
+printf 'PASS: stable pre-open runtime mutation is rejected against the custodied fingerprint.\n'
+
+prepare_live
+unsafe_manifest="${TEMP_ROOT}/unsafe-runtime-fingerprints.expected"
+write_runtime_fingerprints "${unsafe_manifest}"
+chmod 0644 "${unsafe_manifest}"
+mkdir -m 0700 "${TEMP_ROOT}/unsafe-manifest-snapshot"
+if output="$("${canonical_dir}/materialize-attested-snapshot.py" \
+  --git-bin /usr/bin/git \
+  --repo-dir "${TEMP_ROOT}/repo" \
+  --commit "${fixture_commit}" \
+  --source-path docker/warden/tester1 \
+  --live-dir "${TEMP_ROOT}/live" \
+  --snapshot-dir "${TEMP_ROOT}/unsafe-manifest-snapshot" \
+  --runtime-fingerprints "${unsafe_manifest}" \
+  --fingerprint-output "${TEMP_ROOT}/unsafe-manifest-output" 2>&1)"; then
+  fail "Snapshot accepted a writable runtime fingerprint manifest."
+fi
+grep -q 'Runtime fingerprint manifest must have mode 0600' <<<"${output}" \
+  || fail "Unsafe runtime fingerprint manifest failed for an unexpected reason: ${output}"
+printf 'PASS: runtime fingerprint manifest requires builder-only write access.\n'
+
+prepare_live
+bad_mode_runtime_fingerprints="${TEMP_ROOT}/bad-mode-runtime-fingerprints.expected"
+write_runtime_fingerprints "${bad_mode_runtime_fingerprints}"
 chmod 0664 "${TEMP_ROOT}/live/.env"
 mkdir -m 0700 "${TEMP_ROOT}/bad-mode-snapshot"
 if output="$("${canonical_dir}/materialize-attested-snapshot.py" \
@@ -378,12 +458,41 @@ if output="$("${canonical_dir}/materialize-attested-snapshot.py" \
   --source-path docker/warden/tester1 \
   --live-dir "${TEMP_ROOT}/live" \
   --snapshot-dir "${TEMP_ROOT}/bad-mode-snapshot" \
+  --runtime-fingerprints "${bad_mode_runtime_fingerprints}" \
   --fingerprint-output "${TEMP_ROOT}/bad-mode-fingerprints" 2>&1)"; then
   fail "Snapshot accepted an unsafe runtime file mode."
 fi
 grep -q 'Runtime file mode must be 0600: .env' <<<"${output}" \
   || fail "Runtime mode mismatch failed for an unexpected reason: ${output}"
 printf 'PASS: runtime file modes are validated before snapshot completion.\n'
+
+if grep -Fq '|| true' "${canonical_dir}/.warden/warden-env.yml"; then
+  fail "Proxy healthcheck masks Squid probe failures."
+fi
+printf 'PASS: proxy healthcheck propagates Squid probe failures.\n'
+
+cat <<'SH' >"${TEMP_ROOT}/fake-codex"
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >>"${FAKE_CODEX_LOG}"
+SH
+chmod 0755 "${TEMP_ROOT}/fake-codex"
+sed "s#/usr/local/bin/codex#${TEMP_ROOT}/fake-codex#g" \
+  "${canonical_dir}/.warden/runner/codex-warden" >"${TEMP_ROOT}/codex-warden"
+chmod 0755 "${TEMP_ROOT}/codex-warden"
+FAKE_CODEX_LOG="${TEMP_ROOT}/codex-args" \
+  "${TEMP_ROOT}/codex-warden" --search exec --json -
+grep -qx -- '--search exec --sandbox danger-full-access --json -' "${TEMP_ROOT}/codex-args" \
+  || fail "Warden wrapper did not inject the sandbox after the exec subcommand."
+if FAKE_CODEX_LOG="${TEMP_ROOT}/codex-args" \
+  "${TEMP_ROOT}/codex-warden" --search exec --sandbox workspace-write --json - >/dev/null 2>&1; then
+  fail "Warden wrapper accepted a caller-supplied sandbox after global flags."
+fi
+if FAKE_CODEX_LOG="${TEMP_ROOT}/codex-args" \
+  "${TEMP_ROOT}/codex-warden" --search --help >/dev/null 2>&1; then
+  fail "Warden wrapper accepted a non-exec invocation."
+fi
+printf 'PASS: Warden wrapper handles global search flags and fails closed outside exec.\n'
 
 "${ROOT_DIR}/test-provision-secret-argv.sh"
 

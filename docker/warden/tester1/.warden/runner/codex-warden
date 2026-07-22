@@ -1,10 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ "${1:-}" != "exec" ]]; then
-  exec /usr/local/bin/codex "$@"
-fi
-
 expect_config_value=false
 for arg in "$@"; do
   if [[ "${expect_config_value}" == "true" ]]; then
@@ -31,4 +27,15 @@ for arg in "$@"; do
   esac
 done
 
-exec /usr/local/bin/codex exec --sandbox danger-full-access "${@:2}"
+codex_args=("$@")
+global_args=()
+if [[ "${codex_args[0]:-}" == "--search" ]]; then
+  global_args+=("--search")
+  codex_args=("${codex_args[@]:1}")
+fi
+if [[ "${codex_args[0]:-}" != "exec" ]]; then
+  printf 'codex-warden: only the Paperclip exec invocation is allowed\n' >&2
+  exit 64
+fi
+
+exec /usr/local/bin/codex "${global_args[@]}" exec --sandbox danger-full-access "${codex_args[@]:1}"

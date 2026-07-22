@@ -28,15 +28,25 @@ git diff -- attestation/
 
 The privileged builder must be installed from the exact reviewed commit. Its
 fixed installation directory and every parent are root-owned and not writable
-by agents. The builder verifies its own bytes against the selected Git object
-before materializing anything:
+by agents. The selected objects come from a root-owned bare mirror with no
+alternates or hard links; every Git invocation disables replace objects. A
+mutable developer checkout is not an accepted `--repo-dir`.
 
 ```bash
 commit=<full-reviewed-commit-sha>
+mirror=/var/lib/paperclip/warden-source/paperclip.git
+sudo install -d -o root -g root -m 0700 /var/lib/paperclip/warden-source
+sudo /usr/bin/git clone --mirror --no-hardlinks \
+  https://github.com/60770/paperclip.git "${mirror}"
+sudo /usr/bin/git --no-replace-objects -C "${mirror}" fetch --prune origin
+sudo chown -R root:root "${mirror}"
+sudo chmod -R go-w "${mirror}"
 sudo install -d -o root -g root -m 0755 /usr/local/libexec/paperclip-tester1
-git show "${commit}:docker/warden/tester1/rebuild-attested.sh" \
+sudo /usr/bin/git --no-replace-objects -C "${mirror}" \
+  show "${commit}:docker/warden/tester1/rebuild-attested.sh" \
   | sudo tee /usr/local/libexec/paperclip-tester1/rebuild-attested.sh >/dev/null
-git show "${commit}:docker/warden/tester1/materialize-attested-snapshot.py" \
+sudo /usr/bin/git --no-replace-objects -C "${mirror}" \
+  show "${commit}:docker/warden/tester1/materialize-attested-snapshot.py" \
   | sudo tee /usr/local/libexec/paperclip-tester1/materialize-attested-snapshot.py >/dev/null
 sudo chown root:root /usr/local/libexec/paperclip-tester1/*
 sudo chmod 0755 /usr/local/libexec/paperclip-tester1/rebuild-attested.sh \
@@ -54,23 +64,49 @@ chmod 0644 /absolute/path/to/shared/warden/tester1/.warden/runner/authorized_key
   /absolute/path/to/shared/warden/tester1/.warden/runner/ssh_host_ed25519_key.pub
 ```
 
+After reviewing those four runtime inputs, write the independently verified
+digest, mode, and owner inventory under root custody. Supply the reviewed
+values explicitly; do not derive them from the live files in this step or
+regenerate them as part of a rebuild:
+
+```bash
+live_dir=/absolute/path/to/shared/warden/tester1
+runtime_fingerprints=/etc/paperclip-tester1/runtime-fingerprints.sha256
+sudo install -d -o root -g root -m 0700 /etc/paperclip-tester1
+sudo install -o root -g root -m 0600 /dev/null "${runtime_fingerprints}"
+sudoedit "${runtime_fingerprints}"
+```
+
+The file contains exactly the four reviewed values in this format:
+
+```text
+<reviewed-env-sha256> 0600 <reviewed-owner-uid> .env
+<reviewed-authorized-keys-sha256> 0644 <reviewed-owner-uid> .warden/runner/authorized_keys
+<reviewed-host-private-key-sha256> 0600 <reviewed-owner-uid> .warden/runner/ssh_host_ed25519_key
+<reviewed-host-public-key-sha256> 0644 <reviewed-owner-uid> .warden/runner/ssh_host_ed25519_key.pub
+```
+
 Run the installed builder with the same full commit SHA:
 
 ```bash
 sudo /usr/local/libexec/paperclip-tester1/rebuild-attested.sh \
-  --repo-dir "$(git rev-parse --show-toplevel)" \
+  --repo-dir "${mirror}" \
   --commit "${commit}" \
-  --live-dir /absolute/path/to/shared/warden/tester1
+  --live-dir "${live_dir}" \
+  --runtime-fingerprints "${runtime_fingerprints}"
 ```
 
 The builder reads tracked blobs and executable modes directly from the commit,
 opens every runtime path with `O_NOFOLLOW`, checks modes and stable stat
-fingerprints, then freezes the root-owned snapshot below
+fingerprints against the root-owned expected inventory, then freezes the
+root-owned snapshot below
 `/var/lib/paperclip/warden-builder/tester1`. It renders, builds, and starts via
 Docker Compose only from that snapshot. It does not execute the mutable Warden
 installation. Failed postchecks take the environment down; successful
 postchecks compare each running container image ID with the ID captured
-immediately after the snapshot build as well as both immutable labels.
+immediately after the snapshot build as well as both immutable labels. Before
+building, it stores the previous service/container/image map beside the
+snapshot metadata and retains it when build, startup, or postchecks fail.
 
 `sync-live-source.sh` never deletes unexpected live files and is retained for
 non-build operational parity. Use `run-attested.sh` for non-rebuild operations
@@ -309,9 +345,10 @@ installed root-owned boundary:
 
 ```bash
 sudo /usr/local/libexec/paperclip-tester1/rebuild-attested.sh \
-  --repo-dir "$(git rev-parse --show-toplevel)" \
+  --repo-dir /var/lib/paperclip/warden-source/paperclip.git \
   --commit <full-reviewed-commit-sha> \
-  --live-dir /absolute/path/to/shared/warden/tester1
+  --live-dir /absolute/path/to/shared/warden/tester1 \
+  --runtime-fingerprints /etc/paperclip-tester1/runtime-fingerprints.sha256
 ./run-attested.sh --live-dir /absolute/path/to/shared/warden/tester1 -- /opt/warden/bin/warden env ps
 ./run-attested.sh --live-dir /absolute/path/to/shared/warden/tester1 -- /opt/warden/bin/warden env logs --tail=100
 ./run-attested.sh --live-dir /absolute/path/to/shared/warden/tester1 -- /opt/warden/bin/warden env down
@@ -341,9 +378,10 @@ Rebuild the scoped Warden image, then run the deterministic smoke:
 
 ```bash
 sudo /usr/local/libexec/paperclip-tester1/rebuild-attested.sh \
-  --repo-dir "$(git rev-parse --show-toplevel)" \
+  --repo-dir /var/lib/paperclip/warden-source/paperclip.git \
   --commit <full-reviewed-commit-sha> \
-  --live-dir /absolute/path/to/shared/warden/tester1
+  --live-dir /absolute/path/to/shared/warden/tester1 \
+  --runtime-fingerprints /etc/paperclip-tester1/runtime-fingerprints.sha256
 ./run-attested.sh --live-dir /absolute/path/to/shared/warden/tester1 -- ./verify-no-docker-boundary.sh
 RUNNER_SSH_KEY_FILE=/dev/shm/tester1-runner/runner_ed25519 \
 ./run-attested.sh --live-dir /absolute/path/to/shared/warden/tester1 -- ./verify-playwright-boundary.sh

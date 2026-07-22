@@ -45,6 +45,14 @@ sed -i 's/COPY package.json package-lock.json/COPY package.json/' "${TEMP_ROOT}/
 expect_guard_failure "Docker build without package-lock.json"
 
 reset_fixture
+sed -i '/node_modules\/\.bin\/codex \/usr\/local\/bin\/codex/d' "${TEMP_ROOT}/.warden/runner/Dockerfile"
+expect_guard_failure "runner image without the pinned Codex command path"
+
+reset_fixture
+sed -i '/node_modules\/\.bin\/playwright-mcp \/usr\/local\/bin\/playwright-mcp/d' "${TEMP_ROOT}/.warden/runner/Dockerfile"
+expect_guard_failure "runner image without the pinned Playwright MCP command path"
+
+reset_fixture
 printf '\n# /var/run/docker.sock\n' >>"${TEMP_ROOT}/audit-runner-image.sh"
 expect_guard_failure "Docker socket reference in image audit"
 

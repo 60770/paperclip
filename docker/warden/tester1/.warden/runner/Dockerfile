@@ -31,6 +31,8 @@ RUN apt-get update \
         --omit=dev \
         --no-audit \
         --no-fund \
+    && ln -s /opt/runner-tools/node_modules/.bin/codex /usr/local/bin/codex \
+    && ln -s /opt/runner-tools/node_modules/.bin/playwright-mcp /usr/local/bin/playwright-mcp \
     && useradd --create-home --uid 10001 --shell /bin/bash runner \
     && install -d -o runner -g runner -m 0700 /home/runner/.ssh \
     && install -d -o runner -g runner -m 0750 /workspace \
