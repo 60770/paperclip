@@ -1,0 +1,131 @@
+x-warden-attestation-args: &warden-attestation-args
+  WARDEN_SOURCE_MANIFEST_SHA256: ${WARDEN_SOURCE_MANIFEST_SHA256:?source manifest digest required}
+  WARDEN_RENDERED_CONFIG_SHA256: ${WARDEN_RENDERED_CONFIG_SHA256:?rendered config digest required}
+
+services:
+  elasticsearch-hq:
+    profiles:
+      - disabled
+
+  runner:
+    build:
+      context: ./.warden/runner
+      args: *warden-attestation-args
+    restart: unless-stopped
+    depends_on:
+      egress-proxy:
+        condition: service_healthy
+    environment:
+      HTTP_PROXY: http://egress-proxy:3128
+      HTTPS_PROXY: http://egress-proxy:3128
+      ALL_PROXY: http://egress-proxy:3128
+      NO_PROXY: 127.0.0.1,localhost,egress-proxy
+    networks:
+      - sandbox
+    volumes:
+      - qa-tunnel-public:/run/qa-tunnel:ro
+    read_only: true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,size=256m,mode=1777
+      - /run:rw,nosuid,nodev,noexec,size=16m,mode=755
+      - /workspace:rw,exec,nosuid,nodev,size=8g,uid=10001,gid=10001,mode=0750
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 512
+    mem_limit: 6g
+    cpus: 2.0
+    healthcheck:
+      test: ["CMD-SHELL", "ssh-keygen -l -f /home/runner/.ssh/ssh_host_ed25519_key.pub >/dev/null"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+  ssh-proxy:
+    build:
+      context: ./.warden/ssh-proxy
+      args: *warden-attestation-args
+    restart: unless-stopped
+    depends_on:
+      runner:
+        condition: service_healthy
+    command:
+      - TCP-LISTEN:2223,fork,reuseaddr
+      - TCP:runner:2222
+    ports:
+      - "127.0.0.1:2223:2223"
+    networks:
+      - sandbox
+      - default
+    read_only: true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,size=8m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 64
+    mem_limit: 32m
+    cpus: 0.25
+
+  qa-tunnel:
+    build:
+      context: ./.warden/qa-tunnel
+      args: *warden-attestation-args
+    restart: unless-stopped
+    depends_on:
+      ssh-proxy:
+        condition: service_started
+    network_mode: host
+    read_only: true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,size=8m,mode=1777
+    volumes:
+      - qa-tunnel-public:/run/qa-tunnel-public
+      - ./.warden/runner/ssh_host_ed25519_key.pub:/run/config/ssh_host_ed25519_key.pub:ro
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 32
+    mem_limit: 32m
+    cpus: 0.20
+
+  egress-proxy:
+    build:
+      context: ./.warden/proxy
+      args: *warden-attestation-args
+    restart: unless-stopped
+    networks:
+      - sandbox
+      - default
+    read_only: true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,size=64m,mode=1777
+      - /run:rw,nosuid,nodev,noexec,size=16m,mode=755
+      - /var/log/squid:rw,nosuid,nodev,noexec,size=32m,uid=13,gid=13,mode=750
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 128
+    mem_limit: 256m
+    cpus: 0.5
+    healthcheck:
+      test: ["CMD-SHELL", "squidclient -h 127.0.0.1 -p 3128 mgr:info >/dev/null 2>&1 || true"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+
+networks:
+  sandbox:
+    internal: true
+    labels:
+      dev.warden.environment.name: ${WARDEN_ENV_NAME}
+      dev.warden.environment.type: ${WARDEN_ENV_TYPE}
+
+volumes:
+  qa-tunnel-public:

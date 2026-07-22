@@ -1,0 +1,29 @@
+Port 2222
+ListenAddress 0.0.0.0
+HostKey /home/runner/.ssh/ssh_host_ed25519_key
+AuthorizedKeysFile /home/runner/.ssh/authorized_keys
+AuthorizedKeysCommand /usr/local/bin/tunnel-authorized-key
+AuthorizedKeysCommandUser runner
+PidFile /tmp/sshd.pid
+
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+ChallengeResponseAuthentication no
+PermitEmptyPasswords no
+PermitRootLogin no
+AllowUsers runner
+UsePAM no
+StrictModes yes
+
+AllowAgentForwarding no
+AllowTcpForwarding remote
+PermitListen 127.0.0.1:8223 127.0.0.1:8224
+GatewayPorts no
+PermitTunnel no
+X11Forwarding no
+PermitUserEnvironment no
+DisableForwarding no
+SetEnv HTTP_PROXY=http://egress-proxy:3128 HTTPS_PROXY=http://egress-proxy:3128 ALL_PROXY=http://egress-proxy:3128 NO_PROXY=127.0.0.1,localhost,egress-proxy http_proxy=http://egress-proxy:3128 https_proxy=http://egress-proxy:3128 all_proxy=http://egress-proxy:3128 no_proxy=127.0.0.1,localhost,egress-proxy
+
+Subsystem sftp internal-sftp
+LogLevel VERBOSE
