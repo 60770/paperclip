@@ -120,6 +120,29 @@ describe("release broker GitLab integration", () => {
     })).resolves.toMatchObject({ status: "merged" });
     expect(happy.gitlab.mergeCalls).toBe(1);
   });
+
+  it.each([
+    "- [ ] ### **MEDIUM**: authorization bypass remains",
+    "- - ### **HIGH**: authorization bypass remains",
+    "### `CRITICAL`: authorization bypass remains",
+    "### HIGH: authorization bypass remains",
+    "- MEDIUM: authorization bypass remains",
+  ])("keeps merge PUT at zero for a Markdown security finding: %s", async (finding) => {
+    const fixture = boundFixture(finding);
+    await expect(fixture.broker.requestCapability(CLIENT, REQUEST))
+      .rejects.toMatchObject({ code: "paperclip_not_ready" });
+    expect(fixture.gitlab.mergeCalls).toBe(0);
+  });
+
+  it("keeps the broker open for a clear non-finding control", async () => {
+    const fixture = boundFixture("### High-level review summary");
+    const capability = await fixture.broker.requestCapability(CLIENT, REQUEST);
+    await expect(fixture.broker.merge(CLIENT, {
+      capability: capability.capability,
+      requestId: REQUEST.requestId,
+    })).resolves.toMatchObject({ status: "merged" });
+    expect(fixture.gitlab.mergeCalls).toBe(1);
+  });
 });
 
 const COMPANY = "33333333-3333-4333-8333-333333333333";
@@ -130,10 +153,10 @@ const REVIEWER = "66666666-6666-4666-8666-666666666666";
 const REVIEW_STAGE = "77777777-7777-4777-8777-777777777771";
 const APPROVAL_STAGE = "77777777-7777-4777-8777-777777777772";
 
-function boundFixture() {
+function boundFixture(reviewBody = "Review clean: no security findings remain") {
   const gitlab = new BoundGitLab();
   const policy = new ReleasePolicy(
-    new BoundPaperclip(),
+    new BoundPaperclip(reviewBody),
     gitlab,
     new StaticAttestationProvider({
       generation: 7,
@@ -191,6 +214,12 @@ class BoundGitLab implements GitLabMerger {
 }
 
 class BoundPaperclip implements PaperclipReader {
+  readonly #reviewBody: string;
+
+  constructor(reviewBody: string) {
+    this.#reviewBody = reviewBody;
+  }
+
   async getIssue(issueId: string): Promise<PaperclipIssue> {
     if (issueId === "GOT-66") {
       return {
@@ -269,7 +298,7 @@ class BoundPaperclip implements PaperclipReader {
       {
         id: "88888888-8888-4888-8888-888888888882",
         issueId: REQUEST.issueId,
-        body: `APPROVED-REVIEW\nAPPROVED-QA-WAIVED: Backend-only broker\n\ncc [@ReleaseBot](agent://${RELEASE_BOT})`,
+        body: `APPROVED-REVIEW\n\n${this.#reviewBody}\nAPPROVED-QA-WAIVED: Backend-only broker\n\ncc [@ReleaseBot](agent://${RELEASE_BOT})`,
         createdAt: "2026-07-22T12:01:00.000Z",
         deletedAt: null,
         authorType: "agent",

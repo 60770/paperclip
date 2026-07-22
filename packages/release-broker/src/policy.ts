@@ -23,6 +23,10 @@ const MAIN_LOCK = "[MAIN_LOCKED]:";
 const MAIN_UNLOCK = "[MAIN_UNLOCKED]:";
 const HUMAN_REQUIRED = /^\[HUMAN_DECISION_REQUIRED\]:/m;
 const HUMAN_UNBLOCKED = /^\[HUMAN_DECISION_UNBLOCKED\]:[^\n]*\bvia=([^\s]+)/m;
+const SECURITY_SEVERITY = /^(?:BLOCKER|MEDIUM|HIGH|CRITICAL)/i;
+const SECURITY_FINDING_SEPARATOR = /^(?:\s*(?::|[–—])|\s+|$)/;
+const AMBIGUOUS_SECURITY_PREFIX = /^(?:<[^>\n]{1,64}>|\[[^\]\n]{0,32}\]|[^A-Za-z0-9<\[]+)[ \t]*/;
+const MAX_SECURITY_MARKDOWN_DEPTH = 8;
 
 interface MrMarker {
   iid: number;
@@ -103,13 +107,86 @@ function approvalLines(markdown: string): string[] {
 }
 
 function hasSecurityFinding(lines: string[]): boolean {
-  return lines.some((line) => {
-    const withoutList = line
-      .replace(/^\s*(?:(?:[-*+]|\d+[.)])\s+)?/, "")
-      .replace(/^#{1,6}(?:\s+|$)/, "")
-      .replace(/[*_]/g, "");
-    return /^(?:BLOCKER|HIGH)(?:\s*(?::|[–—])|\s+|$)/i.test(withoutList);
-  });
+  return lines.some(hasSecurityFindingLine);
+}
+
+// Grammar: up to eight total list, task-list, heading, emphasis, or inline-code
+// containers, followed by a severity label. Excess depth and severity-like
+// labels hidden by other Markdown forms fail closed.
+function hasSecurityFindingLine(line: string): boolean {
+  let normalized = line.trimStart();
+  let depth = 0;
+
+  while (depth < MAX_SECURITY_MARKDOWN_DEPTH) {
+    const next = stripSecurityMarkdownContainer(normalized);
+    if (next === null) break;
+    normalized = next.trimStart();
+    depth += 1;
+  }
+
+  if (stripSecurityMarkdownContainer(normalized) !== null) return true;
+  if (hasAllowlistedSecurityLabel(normalized, MAX_SECURITY_MARKDOWN_DEPTH - depth)) return true;
+  return hasAmbiguousSecurityLabel(normalized);
+}
+
+function stripSecurityMarkdownContainer(value: string): string | null {
+  const list = /^(?:[-*+]|\d{1,9}[.)])[ \t]+/.exec(value);
+  if (list) return value.slice(list[0].length);
+
+  const task = /^\[[ xX]\][ \t]+/.exec(value);
+  if (task) return value.slice(task[0].length);
+
+  const heading = /^#{1,6}(?:[ \t]+|$)/.exec(value);
+  if (heading) return value.slice(heading[0].length);
+
+  return null;
+}
+
+function hasAllowlistedSecurityLabel(value: string, remainingDepth: number): boolean {
+  const closers: string[] = [];
+  let offset = 0;
+
+  while (value[offset] === "*" || value[offset] === "_" || value[offset] === "`") {
+    const marker = value[offset]!;
+    let length = 1;
+    while (value[offset + length] === marker) length += 1;
+    if (length > 3) return hasAmbiguousSecurityLabel(value);
+    if (closers.length >= remainingDepth) return true;
+    const delimiter = marker.repeat(length);
+    closers.push(delimiter);
+    offset += length;
+  }
+
+  const severity = SECURITY_SEVERITY.exec(value.slice(offset));
+  if (!severity) return false;
+  offset += severity[0].length;
+
+  for (const closer of closers.reverse()) {
+    if (!value.startsWith(closer, offset)) return true;
+    offset += closer.length;
+  }
+
+  const suffix = value.slice(offset);
+  if (SECURITY_FINDING_SEPARATOR.test(suffix)) return true;
+  if (closers.length === 0 && /^-[A-Za-z0-9]/.test(suffix)) return false;
+  return !/^[A-Za-z0-9]/.test(suffix);
+}
+
+function hasAmbiguousSecurityLabel(value: string): boolean {
+  let candidate = value;
+
+  for (let depth = 0; depth < MAX_SECURITY_MARKDOWN_DEPTH; depth += 1) {
+    const prefix = AMBIGUOUS_SECURITY_PREFIX.exec(candidate);
+    if (!prefix) break;
+    candidate = candidate.slice(prefix[0].length);
+  }
+
+  if (AMBIGUOUS_SECURITY_PREFIX.test(candidate)) return true;
+  const severity = SECURITY_SEVERITY.exec(candidate);
+  if (!severity) return false;
+  const suffix = candidate.slice(severity[0].length);
+  if (SECURITY_FINDING_SEPARATOR.test(suffix)) return true;
+  return !/^[A-Za-z0-9-]/.test(suffix);
 }
 
 function assertAuthorShape(comment: PaperclipComment): void {

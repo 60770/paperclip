@@ -140,6 +140,14 @@ describe("ReleasePolicy", () => {
     "#### BLOCKER — authorization bypass remains",
     "- ### **HIGH**: authorization bypass remains",
     "### HIGH - authorization bypass remains",
+    "- MEDIUM: authorization bypass remains",
+    "### CRITICAL — authorization bypass remains",
+    "- [ ] ### **HIGH**: authorization bypass remains",
+    "- - ### **HIGH**: authorization bypass remains",
+    "### `HIGH`: authorization bypass remains",
+    "- [x] 2) #### __MEDIUM__: authorization bypass remains",
+    "~~CRITICAL~~: authorization bypass remains",
+    "[admonition] HIGH: authorization bypass remains",
   ])("rejects Markdown-equivalent security findings: %s", async (finding) => {
     paperclip.comments.get(ISSUE)![1]!.body =
       `APPROVED-REVIEW\n\n${finding}\nAPPROVED-QA-WAIVED: Backend-only broker\n\ncc [@ReleaseBot](agent://${RELEASE_BOT})`;
@@ -156,6 +164,19 @@ describe("ReleasePolicy", () => {
   it("accepts a hyphenated word at the start of a Markdown heading", async () => {
     paperclip.comments.get(ISSUE)![1]!.body =
       `APPROVED-REVIEW\n\n### High-level summary\nAPPROVED-QA-WAIVED: Backend-only broker\n\ncc [@ReleaseBot](agent://${RELEASE_BOT})`;
+    await expect(policy(paperclip, gitlab).authorize(REQUEST)).resolves.toBeDefined();
+  });
+
+  it("fails closed when Markdown container depth exceeds the documented limit", async () => {
+    paperclip.comments.get(ISSUE)![1]!.body =
+      `APPROVED-REVIEW\n\n${"- ".repeat(9)}Review clean\nAPPROVED-QA-WAIVED: Backend-only broker\n\ncc [@ReleaseBot](agent://${RELEASE_BOT})`;
+    await expect(policy(paperclip, gitlab).authorize(REQUEST))
+      .rejects.toMatchObject({ code: "paperclip_not_ready" });
+  });
+
+  it("accepts non-finding severity-prefixed words", async () => {
+    paperclip.comments.get(ISSUE)![1]!.body =
+      `APPROVED-REVIEW\n\n### High-level summary\n- Medium-term follow-up\nCriticality reviewed\nAPPROVED-QA-WAIVED: Backend-only broker\n\ncc [@ReleaseBot](agent://${RELEASE_BOT})`;
     await expect(policy(paperclip, gitlab).authorize(REQUEST)).resolves.toBeDefined();
   });
 
