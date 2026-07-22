@@ -17,6 +17,7 @@ fail() {
 }
 
 validate_runtime_key() {
+  local authorized_key
   local authorized_fingerprint
   local key_path
   local runtime_fingerprint
@@ -34,8 +35,10 @@ validate_runtime_key() {
   esac
 
   runtime_fingerprint="$(ssh-keygen -y -f "${RUNNER_KEY_FILE}" | ssh-keygen -lf - | awk '{print $2}')"
-  authorized_fingerprint="$(sed -E 's/^.*(ssh-ed25519 [^ ]+).*$/\1/' \
-    "${ROOT_DIR}/.warden/runner/authorized_keys" | ssh-keygen -lf - | awk '{print $2}')"
+  authorized_key="$(docker exec paperclip-tester1-runner-1 \
+    sed -nE 's/^.*(ssh-ed25519 [^ ]+).*$/\1/p' /home/runner/.ssh/authorized_keys)"
+  [[ -n "${authorized_key}" ]] || fail "Running Warden has no authorized runner key."
+  authorized_fingerprint="$(printf '%s\n' "${authorized_key}" | ssh-keygen -lf - | awk '{print $2}')"
   [[ "${runtime_fingerprint}" == "${authorized_fingerprint}" ]] \
     || fail "Runtime key does not match the runner authorized key."
 }
@@ -63,26 +66,27 @@ resolve_api_base() {
 
 api_base="$(resolve_api_base)"
 
-cli_args=(--api-base "${api_base}")
-if [[ -n "${PAPERCLIP_BOARD_API_KEY:-}" ]]; then
-  cli_args+=(--api-key "${PAPERCLIP_BOARD_API_KEY}")
-elif [[ -n "${PAPERCLIP_BOARD_PROFILE:-}" ]]; then
-  cli_args+=(--profile "${PAPERCLIP_BOARD_PROFILE}")
-fi
+[[ -z "${PAPERCLIP_BOARD_API_KEY:-}" ]] \
+  || fail "PAPERCLIP_BOARD_API_KEY is forbidden; use PAPERCLIP_BOARD_PROFILE."
+[[ -n "${PAPERCLIP_BOARD_PROFILE:-}" ]] \
+  || fail "Set PAPERCLIP_BOARD_PROFILE to an authenticated board instance-admin profile."
 
-health="$(paperclipai health --json "${cli_args[@]}")"
+cli_args=(--api-base "${api_base}" --profile "${PAPERCLIP_BOARD_PROFILE}")
+
+paperclip_cli() {
+  env -u PAPERCLIP_API_KEY paperclipai "$@"
+}
+
+health="$(paperclip_cli health --json "${cli_args[@]}")"
 jq -e '.status == "ok" and .authReady == true' <<<"${health}" >/dev/null \
   || fail "Paperclip health preflight failed for ${api_base}."
 
-if ! paperclipai whoami --json "${cli_args[@]}" >/dev/null; then
-  fail "Authenticate a board instance-admin CLI profile, export its API key, then set PAPERCLIP_BOARD_PROFILE."
+if ! paperclip_cli whoami --json "${cli_args[@]}" >/dev/null; then
+  fail "Authenticate a board instance-admin CLI profile, then set PAPERCLIP_BOARD_PROFILE."
 fi
 
 [[ "${ROTATE_RUNNER_KEY}" == "0" || "${ROTATE_RUNNER_KEY}" == "1" ]] \
   || fail "ROTATE_RUNNER_KEY must be 0 or 1."
-if [[ "${ROTATE_RUNNER_KEY}" == "1" ]]; then
-  validate_runtime_key
-fi
 
 for container in \
   paperclip-tester1-runner-1 \
@@ -95,16 +99,22 @@ done
 if docker inspect paperclip-tester1-docker-daemon-1 >/dev/null 2>&1; then
   fail "Legacy privileged Docker daemon still exists; remove the orphan before assigning Tester1."
 fi
+if [[ "${ROTATE_RUNNER_KEY}" == "1" ]]; then
+  validate_runtime_key
+fi
 
 known_hosts="$(ssh-keyscan -p 2223 -t ed25519 127.0.0.1 2>/dev/null | awk 'NF == 3 { print; exit }')"
 [[ -n "${known_hosts}" ]] || fail "Could not read the Warden SSH host key."
 
-expected_fingerprint="$(ssh-keygen -lf "${ROOT_DIR}/.warden/runner/ssh_host_ed25519_key.pub" | awk '{print $2}')"
+expected_host_key="$(docker exec paperclip-tester1-runner-1 \
+  sed -n '1p' /home/runner/.ssh/ssh_host_ed25519_key.pub)"
+[[ -n "${expected_host_key}" ]] || fail "Running Warden has no SSH host public key."
+expected_fingerprint="$(printf '%s\n' "${expected_host_key}" | ssh-keygen -lf - | awk '{print $2}')"
 scanned_fingerprint="$(printf '%s\n' "${known_hosts}" | ssh-keygen -lf - | awk '{print $2}')"
 [[ "${expected_fingerprint}" == "${scanned_fingerprint}" ]] \
   || fail "Warden SSH host-key fingerprint mismatch."
 
-environment_list="$(paperclipai environment list \
+environment_list="$(paperclip_cli environment list \
   --company-id "${COMPANY_ID}" \
   --json \
   "${cli_args[@]}")"
@@ -114,7 +124,7 @@ match_count="$(jq --arg name "${ENVIRONMENT_NAME}" '[.[] | select(.name == $name
 
 if [[ "${match_count}" == "1" ]]; then
   environment_id="$(jq -r --arg name "${ENVIRONMENT_NAME}" '.[] | select(.name == $name) | .id' <<<"${environment_list}")"
-  saved_environment="$(paperclipai environment get "${environment_id}" --json "${cli_args[@]}")"
+  saved_environment="$(paperclip_cli environment get "${environment_id}" --json "${cli_args[@]}")"
   jq -e '
     .driver == "ssh" and
     .status == "active" and
@@ -132,16 +142,24 @@ if [[ "${match_count}" == "1" ]]; then
   if [[ "${ROTATE_RUNNER_KEY}" == "1" ]]; then
     secret_id="$(jq -er '.config.privateKeySecretRef.secretId' <<<"${saved_environment}")"
     TESTER1_RUNNER_KEY_VALUE="$(<"${RUNNER_KEY_FILE}")" \
-      paperclipai secrets rotate "${secret_id}" \
+      paperclip_cli secrets rotate "${secret_id}" \
         --value-env TESTER1_RUNNER_KEY_VALUE \
         --json \
         "${cli_args[@]}" >/dev/null
   fi
 else
   validate_runtime_key
-  private_key="$(<"${RUNNER_KEY_FILE}")"
+  created_secret="$(TESTER1_RUNNER_KEY_VALUE="$(<"${RUNNER_KEY_FILE}")" \
+    paperclip_cli secrets create \
+      --company-id "${COMPANY_ID}" \
+      --name "Tester1 Warden runner SSH key ${BASHPID}" \
+      --description "Runtime private key for the Tester1 Warden SSH environment." \
+      --value-env TESTER1_RUNNER_KEY_VALUE \
+      --json \
+      "${cli_args[@]}")"
+  secret_id="$(jq -er '.id' <<<"${created_secret}")"
   payload="$(jq -n \
-    --arg privateKey "${private_key}" \
+    --arg secretId "${secret_id}" \
     --arg knownHosts "${known_hosts}" \
     '{
       name: "Tester1 Warden",
@@ -153,7 +171,11 @@ else
         port: 2223,
         username: "runner",
         remoteWorkspacePath: "/workspace",
-        privateKey: $privateKey,
+        privateKeySecretRef: {
+          type: "secret_ref",
+          secretId: $secretId,
+          version: "latest"
+        },
         knownHosts: $knownHosts,
         strictHostKeyChecking: true
       },
@@ -164,7 +186,7 @@ else
         wardenEnvironment: "paperclip-tester1"
       }
     }')"
-  created="$(paperclipai environment create \
+  created="$(paperclip_cli environment create \
     --company-id "${COMPANY_ID}" \
     --payload-json "${payload}" \
     --json \
@@ -172,7 +194,7 @@ else
   environment_id="$(jq -er '.id' <<<"${created}")"
 fi
 
-saved_environment="$(paperclipai environment get "${environment_id}" --json "${cli_args[@]}")"
+saved_environment="$(paperclip_cli environment get "${environment_id}" --json "${cli_args[@]}")"
 jq -e '
   .config.privateKey == null and
   .config.privateKeySecretRef.type == "secret_ref" and
@@ -180,26 +202,26 @@ jq -e '
 ' <<<"${saved_environment}" >/dev/null \
   || fail "Runner private key is not backed by a Paperclip secret reference."
 
-probe="$(paperclipai environment probe "${environment_id}" --json "${cli_args[@]}")"
+probe="$(paperclip_cli environment probe "${environment_id}" --json "${cli_args[@]}")"
 jq -e '.ok == true and .driver == "ssh"' <<<"${probe}" >/dev/null \
   || fail "Paperclip environment probe failed for ${environment_id}."
 
-paperclipai agent update "${TESTER1_ID}" \
+paperclip_cli agent update "${TESTER1_ID}" \
   --payload-json "$(jq -cn --arg id "${environment_id}" '{defaultEnvironmentId:$id}')" \
   --json \
   "${cli_args[@]}" >/dev/null
 
-tester1="$(paperclipai agent get "${TESTER1_ID}" --json "${cli_args[@]}")"
+tester1="$(paperclip_cli agent get "${TESTER1_ID}" --json "${cli_args[@]}")"
 [[ "$(jq -r '.defaultEnvironmentId // ""' <<<"${tester1}")" == "${environment_id}" ]] \
   || fail "Tester1 defaultEnvironmentId was not updated."
 
-agents="$(paperclipai agent list --company-id "${COMPANY_ID}" --json "${cli_args[@]}")"
+agents="$(paperclip_cli agent list --company-id "${COMPANY_ID}" --json "${cli_args[@]}")"
 other_assignments="$(jq --arg id "${environment_id}" --arg tester "${TESTER1_ID}" \
   '[.[] | select(.defaultEnvironmentId == $id and .id != $tester)] | length' <<<"${agents}")"
 [[ "${other_assignments}" == "0" ]] \
   || fail "The Warden environment is assigned to an agent other than Tester1."
 
-tester1_configuration="$(paperclipai agent configuration "${TESTER1_ID}" \
+tester1_configuration="$(paperclip_cli agent configuration "${TESTER1_ID}" \
   --json \
   "${cli_args[@]}")"
 jq -e '.adapterType == "codex_local"' <<<"${tester1_configuration}" >/dev/null \
@@ -210,7 +232,7 @@ adapter_test_payload="$(jq -n \
   --arg environmentId "${environment_id}" \
   --argjson adapterConfig "${adapter_config}" \
   '{environmentId:$environmentId, adapterConfig:$adapterConfig}')"
-adapter_test="$(paperclipai adapter test-environment codex_local \
+adapter_test="$(paperclip_cli adapter test-environment codex_local \
   --company-id "${COMPANY_ID}" \
   --payload-json "${adapter_test_payload}" \
   --json \

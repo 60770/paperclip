@@ -212,4 +212,6 @@ grep -q 'Rendered Warden config does not match the Git-tracked hash' <<<"${outpu
   || fail "Rendered config drift was not stopped before rebuild."
 printf 'PASS: rendered config drift is rejected before rebuild.\n'
 
+"${ROOT_DIR}/test-provision-secret-argv.sh"
+
 printf 'PASS: attestation regression gate.\n'

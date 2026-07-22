@@ -45,6 +45,8 @@ non-rebuild operations and boundary verification:
 `test-attestation-gate.sh` mutates a verifier and the Warden config in isolated
 fixtures, injects runtime-only SSH material into a source manifest, and proves
 each change is rejected before Warden invocation or live-file writes.
+`test-provision-secret-argv.sh` exercises new-environment and key-rotation
+provisioning with sentinel credentials and proves neither value enters argv.
 
 ## Security boundary
 
@@ -157,16 +159,12 @@ and denied arbitrary and production egress. Its invocation metadata must contain
 `--dangerously-bypass-approvals-and-sandbox`.
 
 Instance-environment registration is deliberately restricted by Paperclip to a
-board instance-admin. From an authenticated board CLI context, run:
-
-```bash
-./provision-paperclip.sh
-```
-
-The helper resolves the control-plane URL from `PAPERCLIP_BOARD_API_URL`, then
-`PAPERCLIP_API_URL`, then the instance config's `auth.publicBaseUrl`. A malformed
-value such as bare `localhost` is ignored in favor of the instance config. To
-create a dedicated authenticated board profile and use it:
+board instance-admin. The helper requires a dedicated authenticated profile,
+rejects literal `PAPERCLIP_BOARD_API_KEY`, and clears ambient
+`PAPERCLIP_API_KEY` before each CLI call. It resolves the control-plane URL from
+`PAPERCLIP_BOARD_API_URL`, then `PAPERCLIP_API_URL`, then the instance config's
+`auth.publicBaseUrl`. A malformed value such as bare `localhost` is ignored in
+favor of the instance config. Create the profile and run:
 
 ```bash
 export PAPERCLIP_BOARD_API_URL="$(jq -r '.auth.publicBaseUrl' ../../../../../config.json)"
@@ -192,7 +190,7 @@ the runner with its public key, then rotate the existing Paperclip secret:
 ```bash
 RUNNER_SSH_KEY_FILE=/dev/shm/tester1-runner/runner_ed25519 \
 ROTATE_RUNNER_KEY=1 \
-PAPERCLIP_BOARD_API_KEY="${PAPERCLIP_TESTER1_BOARD_KEY}" \
+PAPERCLIP_BOARD_PROFILE=tester1-provision \
 ./provision-paperclip.sh
 ```
 
