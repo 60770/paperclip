@@ -209,6 +209,7 @@ import {
 } from "./recovery/model-profile-hint.js";
 import { recoveryService } from "./recovery/service.js";
 import { productivityReviewService } from "./productivity-review.js";
+import { sweepRemoteRunRetention } from "./remote-run-retention.js";
 import { resolveRequiredSuccessfulRunHandoffOnValidPath } from "./successful-run-handoff-state.js";
 import { taskWatchdogService } from "./task-watchdogs.js";
 import { withAgentStartLock } from "./agent-start-lock.js";
@@ -13330,6 +13331,44 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           payload: event.payload,
         });
       };
+
+      if (executionTarget?.kind === "remote") {
+        try {
+          const retentionResult = await sweepRemoteRunRetention({
+            db,
+            currentRunId: run.id,
+            target: executionTarget,
+            env: runtimeEnv,
+          });
+          if (retentionResult.deletedCount > 0) {
+            await onLog(
+              "stdout",
+              `[paperclip] Remote run retention removed ${retentionResult.deletedCount} terminal run ${retentionResult.deletedCount === 1 ? "directory" : "directories"} and freed ${retentionResult.bytesFreed} bytes.\n`,
+            );
+          }
+          if (retentionResult.diskWarning || retentionResult.errorCount > 0) {
+            const diskUsageBefore = retentionResult.diskUsedPercentBefore === null
+              ? "unavailable"
+              : `${retentionResult.diskUsedPercentBefore}%`;
+            const diskUsageAfter = retentionResult.diskUsedPercentAfter === null
+              ? "unchanged"
+              : `${retentionResult.diskUsedPercentAfter}%`;
+            await onLog(
+              "stderr",
+              `[paperclip] Remote run retention warning: disk usage ${diskUsageBefore} before and ${diskUsageAfter} after cleanup, warning threshold ${retentionResult.diskWarningPercent}%, errors ${retentionResult.errorCount}.\n`,
+            );
+          }
+        } catch (retentionError) {
+          logger.warn(
+            { err: retentionError, runId: run.id, errorCount: 1 },
+            "remote run retention sweep failed unexpectedly",
+          );
+          await onLog(
+            "stderr",
+            `[paperclip] Remote run retention warning: sweep failed before adapter startup; no run directories were removed.\n`,
+          );
+        }
+      }
 
       const adapter = getServerAdapter(agent.adapterType);
       const localAgentJwtScope =
