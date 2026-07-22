@@ -32,6 +32,26 @@ expect_guard_failure() {
 
 "${GUARD}"
 
+short_digest="$(printf 'a%.0s' {1..63})"
+valid_digest="$(printf 'b%.0s' {1..64})"
+for service in runner proxy qa-tunnel ssh-proxy; do
+  dockerfile="${ROOT_DIR}/.warden/${service}/Dockerfile"
+  digest_validation="$(
+    sed -n '/^RUN for digest /,/^    done$/p' "${dockerfile}" \
+      | sed '1s/^RUN //; s/[[:space:]]*\\$//'
+  )"
+  if WARDEN_SOURCE_MANIFEST_SHA256="${short_digest}" \
+    WARDEN_RENDERED_CONFIG_SHA256="${valid_digest}" \
+    /bin/sh -c "${digest_validation}"; then
+    fail "${service} image accepted a short source digest followed by a valid rendered digest."
+  else
+    status="$?"
+  fi
+  [[ "${status}" == "64" ]] \
+    || fail "${service} image rejected a short source digest with unexpected status ${status}."
+done
+printf 'PASS: every image rejects a short first attestation digest.\n'
+
 reset_fixture
 sed -i -E 's/@sha256:[0-9a-f]{64}//' "${TEMP_ROOT}/.warden/runner/Dockerfile"
 expect_guard_failure "mutable FROM"

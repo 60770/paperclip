@@ -568,6 +568,75 @@ describe("sandbox callback bridge", () => {
     await expect(readFile(path.posix.join(directories.responsesDir, "req-b.json"), "utf8")).resolves.toContain("\"req-b\"");
   });
 
+  it("rejects malformed attachment chunk queries and continues draining queued requests", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-bridge-invalid-query-"));
+    cleanupDirs.push(rootDir);
+
+    const queueDir = path.posix.join(rootDir, "queue");
+    const directories = sandboxCallbackBridgeDirectories(queueDir);
+    const processed: string[] = [];
+
+    const worker = await startSandboxCallbackBridgeWorker({
+      client: createFileSystemSandboxCallbackBridgeQueueClient(),
+      queueDir,
+      handleRequest: async (request) => {
+        processed.push(request.id);
+        return {
+          status: 200,
+          body: request.id,
+        };
+      },
+    });
+
+    const chunkRequest = {
+      method: "GET",
+      path: "/api/attachments/attachment-1/content/chunk",
+      headers: {},
+      body: "",
+      createdAt: new Date().toISOString(),
+    };
+    await writeFile(
+      path.posix.join(directories.requestsDir, "req-a.json"),
+      `${JSON.stringify({ id: "req-a", ...chunkRequest })}\n`,
+      "utf8",
+    );
+    await writeFile(
+      path.posix.join(directories.requestsDir, "req-b.json"),
+      `${JSON.stringify({ id: "req-b", ...chunkRequest, query: 42 })}\n`,
+      "utf8",
+    );
+    await writeFile(
+      path.posix.join(directories.requestsDir, "req-c.json"),
+      `${JSON.stringify({
+        id: "req-c",
+        method: "GET",
+        path: "/api/agents/me",
+        query: "",
+        headers: {},
+        body: "",
+        createdAt: new Date().toISOString(),
+      })}\n`,
+      "utf8",
+    );
+
+    await worker.stop({ drainTimeoutMs: 1_000 });
+
+    expect(processed).toEqual(["req-c"]);
+    for (const requestId of ["req-a", "req-b"]) {
+      const response = JSON.parse(
+        await readFile(path.posix.join(directories.responsesDir, `${requestId}.json`), "utf8"),
+      ) as { status: number; body: string };
+      expect(response.status).toBe(400);
+      expect(JSON.parse(response.body)).toEqual({
+        error:
+          "Invalid attachment chunk request. Expected offset=<non-negative integer>, length=<1..131072>, and encoding=base64.",
+      });
+    }
+    await expect(readFile(path.posix.join(directories.responsesDir, "req-c.json"), "utf8")).resolves.toContain(
+      "\"req-c\"",
+    );
+  });
+
   it("writes fast 503 responses for queued requests that miss the drain deadline", async () => {
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-bridge-drain-timeout-"));
     cleanupDirs.push(rootDir);
