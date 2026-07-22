@@ -211,7 +211,9 @@ describe("ssh env-lab fixture", () => {
 
     try {
       const identityFileIndex = target.args.indexOf("-i");
-      expect(target.args.slice(identityFileIndex - 2, identityFileIndex + 1)).toEqual([
+      expect(target.args.slice(identityFileIndex - 4, identityFileIndex + 1)).toEqual([
+        "-F",
+        "none",
         "-o",
         "IdentitiesOnly=yes",
         "-i",
@@ -244,6 +246,8 @@ describe("ssh env-lab fixture", () => {
     try {
       expect(target.args).not.toContain("IdentitiesOnly=yes");
       expect(target.args).not.toContain("-i");
+      // -F none isolation is scoped to the configured-key branch only.
+      expect(target.args).not.toContain("-F");
     } finally {
       await target.cleanup();
     }

@@ -413,7 +413,11 @@ async function createSshAuthArgs(
   if (config.privateKey) {
     const privateKey = await withTempFile("paperclip-ssh-key-", config.privateKey, 0o600);
     tempFiles.push(privateKey.cleanup);
-    sshArgs.push("-o", "IdentitiesOnly=yes", "-i", privateKey.path);
+    // Ignore any per-user/system ssh_config so an explicit IdentityFile there
+    // cannot be offered alongside the materialized Paperclip temp key. Only the
+    // configured private key branch isolates config; the default-identity
+    // fallback (no privateKey) intentionally keeps normal ssh_config behavior.
+    sshArgs.push("-F", "none", "-o", "IdentitiesOnly=yes", "-i", privateKey.path);
   }
 
   return {
