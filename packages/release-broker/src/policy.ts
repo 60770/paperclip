@@ -27,6 +27,7 @@ const SECURITY_SEVERITY = /^(?:BLOCKER|MEDIUM|HIGH|CRITICAL)/i;
 const SECURITY_FINDING_SEPARATOR = /^(?:\s*(?::|[–—])|-(?=\s|$)|\s+|$)/;
 const AMBIGUOUS_SECURITY_PREFIX = /^(?:<[^>\n]{1,64}>|\[[^\]\n]{0,32}\]|[^A-Za-z0-9<\[]+)[ \t]*/;
 const MAX_SECURITY_MARKDOWN_DEPTH = 8;
+const SECURITY_LABELS = ["BLOCKER", "MEDIUM", "HIGH", "CRITICAL"] as const;
 
 interface MrMarker {
   iid: number;
@@ -111,9 +112,9 @@ function hasSecurityFinding(lines: string[]): boolean {
 }
 
 // Grammar: up to eight total list, task-list, heading, emphasis, inline-code,
-// link/image-label, or angle-bracket containers followed by a severity label.
-// Wrapper contents are normalized recursively; malformed forms and excess
-// depth fail closed.
+// numeric entity, link/image-label, or angle-bracket containers followed by a
+// severity label. Wrapper and inline fragments are normalized recursively;
+// malformed forms and excess depth fail closed.
 function hasSecurityFindingLine(line: string): boolean {
   return hasSecurityLabelInMarkdown(line.trimStart(), MAX_SECURITY_MARKDOWN_DEPTH);
 }
@@ -164,7 +165,7 @@ function hasAllowlistedSecurityLabel(value: string, remainingDepth: number): boo
   }
 
   const severity = SECURITY_SEVERITY.exec(value.slice(offset));
-  if (!severity) return false;
+  if (!severity) return hasFragmentedSecurityLabel(value, remainingDepth);
   offset += severity[0].length;
 
   for (const closer of closers.reverse()) {
@@ -176,6 +177,74 @@ function hasAllowlistedSecurityLabel(value: string, remainingDepth: number): boo
   if (SECURITY_FINDING_SEPARATOR.test(suffix)) return true;
   if (closers.length === 0 && /^-[A-Za-z0-9]/.test(suffix)) return false;
   return !/^[A-Za-z0-9]/.test(suffix);
+}
+
+function hasFragmentedSecurityLabel(value: string, remainingDepth: number): boolean {
+  const delimiters: string[] = [];
+  let normalized = "";
+  let fragments = 0;
+
+  for (let offset = 0; offset < value.length;) {
+    const state = securityLabelPrefixState(normalized);
+    if (state === "finding") return true;
+    if (state === "none") return false;
+
+    const marker = value[offset];
+    if (marker === "*" || marker === "_" || marker === "`" || marker === "~") {
+      let length = 1;
+      while (value[offset + length] === marker) length += 1;
+      if (length > 3 || (marker === "~" && length !== 2)) return true;
+
+      const delimiter = marker.repeat(length);
+      if (delimiters.at(-1) === delimiter) {
+        delimiters.pop();
+      } else {
+        if (delimiters.some((open) => open[0] === marker) || fragments >= remainingDepth) return true;
+        delimiters.push(delimiter);
+        fragments += 1;
+      }
+      offset += length;
+      continue;
+    }
+
+    if (marker === "&") {
+      const entity = /^&#(?:([0-9]{1,7})|[xX]([0-9A-Fa-f]{1,6}));/.exec(value.slice(offset));
+      if (!entity || fragments >= remainingDepth) return true;
+      const codePoint = Number.parseInt(entity[1] ?? entity[2]!, entity[1] ? 10 : 16);
+      if (codePoint < 0x20 || codePoint > 0x7e) return true;
+      normalized += String.fromCodePoint(codePoint);
+      fragments += 1;
+      offset += entity[0].length;
+      continue;
+    }
+
+    if (marker === "!" || marker === "[" || marker === "]" || marker === "<" || marker === ">") return true;
+
+    normalized += marker;
+    offset += 1;
+  }
+
+  if (delimiters.length > 0) return true;
+  const state = securityLabelPrefixState(normalized);
+  return state === "finding" || state === "exact" || state === "hyphen";
+}
+
+function securityLabelPrefixState(value: string): "partial" | "exact" | "hyphen" | "finding" | "none" {
+  const normalized = value.toUpperCase();
+
+  for (const label of SECURITY_LABELS) {
+    if (label.startsWith(normalized)) return label === normalized ? "exact" : "partial";
+    if (!normalized.startsWith(label)) continue;
+
+    const suffix = value.slice(label.length);
+    if (suffix.length === 0) return "exact";
+    if (/^[\s:–—]/.test(suffix)) return "finding";
+    if (suffix[0] !== "-") return /^[A-Za-z0-9]/.test(suffix) ? "none" : "finding";
+    if (suffix.length === 1) return "hyphen";
+    return /^[A-Za-z0-9]/.test(suffix.slice(1)) ? "none" : "finding";
+  }
+
+  return "none";
 }
 
 function hasAmbiguousSecurityLabel(value: string, remainingDepth: number): boolean {

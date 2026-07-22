@@ -159,6 +159,13 @@ describe("ReleasePolicy", () => {
     "![`HIGH`](badge): authorization bypass remains",
     "[__MEDIUM__]: authorization bypass remains",
     "<**BLOCKER**>: authorization bypass remains",
+    "### H**IG**H: authorization bypass remains",
+    "### H`IG`H: authorization bypass remains",
+    "### H&#73;GH: authorization bypass remains",
+    "### H&#x49;GH: authorization bypass remains",
+    "### H~~IG~~H: authorization bypass remains",
+    "### H[IG](https://example.invalid)H: authorization bypass remains",
+    "### H<!-- hidden -->IGH: authorization bypass remains",
     "> HIGH: authorization bypass remains",
     "```text\nCRITICAL: authorization bypass remains\n```",
   ])("rejects Markdown-equivalent security findings: %s", async (finding) => {
