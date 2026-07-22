@@ -295,6 +295,75 @@ describeEmbeddedPostgres("heartbeat worktree suppression", () => {
     await heartbeat.waitForRunExecutionDrain(userRun!.id);
   }, 10_000);
 
+  it("keeps a successful approval participant timer-eligible after the worktree cutoff", async () => {
+    const { companyId, agentId, issueId } = await insertAgentAndIssue();
+    const issueCreatedAt = await db
+      .select({ createdAt: issues.createdAt })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]!.createdAt);
+    const cutoff = new Date(issueCreatedAt.getTime() - 1_000);
+    const finishedAt = new Date(issueCreatedAt.getTime() + 1_000);
+    const stageId = randomUUID();
+
+    await armWorktreeRunExecution(cutoff);
+    await db
+      .update(issues)
+      .set({
+        status: "in_review",
+        executionState: {
+          status: "pending",
+          currentStageId: stageId,
+          currentStageIndex: 0,
+          currentStageType: "approval",
+          currentParticipant: { type: "agent", agentId, userId: null },
+          returnAssignee: null,
+          reviewRequest: null,
+          completedStageIds: [],
+          lastDecisionId: null,
+          lastDecisionOutcome: null,
+        },
+        updatedAt: finishedAt,
+      })
+      .where(eq(issues.id, issueId));
+    await db
+      .update(agents)
+      .set({ lastHeartbeatAt: finishedAt, updatedAt: finishedAt })
+      .where(eq(agents.id, agentId));
+    await db.insert(heartbeatRuns).values({
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: "succeeded",
+      responsibleUserId: "responsible-user",
+      contextSnapshot: {
+        issueId,
+        currentStageId: stageId,
+        currentStageType: "approval",
+      },
+      startedAt: new Date(finishedAt.getTime() - 500),
+      finishedAt,
+    });
+    const heartbeat = heartbeatService(db, {
+      runtimeEnv: {
+        PAPERCLIP_IN_WORKTREE: "true",
+        PAPERCLIP_INSTANCE_ID: "test-worktree",
+      },
+    });
+
+    const tick = await heartbeat.tickTimers(new Date(finishedAt.getTime() + 61_000));
+
+    expect(tick.enqueued).toBe(1);
+    const timerRun = await db
+      .select({ id: heartbeatRuns.id })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.invocationSource, "timer"))
+      .then((rows) => rows[0] ?? null);
+    expect(timerRun).not.toBeNull();
+    await heartbeat.waitForRunExecutionDrain(timerRun!.id);
+  }, 10_000);
+
   it("still creates live-plane assignment runs when suppression is not active", async () => {
     const { agentId, issueId } = await insertAgentAndIssue();
     await db

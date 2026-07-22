@@ -2622,6 +2622,19 @@ function isExecutionReviewParticipantRecoveryEligibleRun(
   );
 }
 
+function isExecutionReviewParticipantRunForStage(
+  run: Pick<typeof heartbeatRuns.$inferSelect, "contextSnapshot"> | null,
+  stageId: string | null | undefined,
+) {
+  if (!run || !stageId) return false;
+  const context = parseObject(run.contextSnapshot);
+  const executionStage = parseObject(context.executionStage);
+  const runStageId =
+    readNonEmptyString(executionStage.stageId) ??
+    readNonEmptyString(context.currentStageId);
+  return runStageId === stageId;
+}
+
 function normalizeLedgerBillingType(value: unknown): BillingType {
   const raw = readNonEmptyString(value);
   switch (raw) {
@@ -14810,12 +14823,34 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const currentParticipant = executionState?.status === "pending"
         ? executionState.currentParticipant
         : null;
+      const recoveryHeartbeatPolicy = recoveryAgent ? parseHeartbeatPolicy(recoveryAgent) : null;
+      const isReviewParticipantRecoveryRun = isExecutionReviewParticipantRecoveryRun(run);
+      const successfulApprovalHold =
+        executionState?.currentStageType === "approval" &&
+        run.status === "succeeded" &&
+        !isReviewParticipantRecoveryRun &&
+        isExecutionReviewParticipantRecoveryEligibleRun(run) &&
+        isExecutionReviewParticipantRunForStage(run, executionState.currentStageId) &&
+        (
+          issueHasPersistedMonitor ||
+          (
+            recoveryAgentInvokable &&
+            recoveryHeartbeatPolicy?.enabled === true &&
+            recoveryHeartbeatPolicy.intervalSec > 0 &&
+            !recoveryHeartbeatPolicy.skipTimerWhenNoActionableWork &&
+            recoveryHeartbeatPolicy.maxDailyRuns !== 0 &&
+            recoveryHeartbeatPolicy.maxDailyCostCents !== 0
+          ) ||
+          Boolean(await findExplicitBlockerPath())
+        );
       const issueNeedsReviewParticipantRecovery =
         issue.status === "in_review" &&
         !issue.assigneeUserId &&
         currentParticipant?.type === "agent" &&
         currentParticipant.agentId === run.agentId &&
+        !successfulApprovalHold &&
         isExecutionReviewParticipantRecoveryEligibleRun(run) &&
+        isExecutionReviewParticipantRunForStage(run, executionState?.currentStageId) &&
         HEARTBEAT_RUN_TERMINAL_STATUSES.includes(
           run.status as (typeof HEARTBEAT_RUN_TERMINAL_STATUSES)[number],
         );
@@ -14825,7 +14860,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         if (
           options.suppressImmediateRecovery ||
           existingReviewParticipantExecutionPath ||
-          issueHasPersistedMonitor ||
+          (
+            issueHasPersistedMonitor &&
+            run.status === "succeeded" &&
+            !isReviewParticipantRecoveryRun
+          ) ||
           await isAutomaticRecoverySuppressedByPauseHold(db, issue.companyId, issue.id, treeControlSvc)
         ) {
           return { kind: "released" as const };
@@ -14842,7 +14881,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         const shouldBlockReviewRecovery =
           !recoveryAgentInvokable ||
           !recoveryAgent ||
-          isExecutionReviewParticipantRecoveryRun(run);
+          isReviewParticipantRecoveryRun;
         if (shouldBlockReviewRecovery) {
           return {
             kind: "blocked" as const,
@@ -17014,7 +17053,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             .where(and(
               eq(issues.companyId, agent.companyId),
               eq(issues.assigneeAgentId, agent.id),
-              inArray(issues.status, ["todo", "in_progress"]),
+              inArray(issues.status, ["todo", "in_progress", "in_review"]),
               gte(issues.createdAt, cutoff),
             ))
             .limit(1)

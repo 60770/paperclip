@@ -101,6 +101,7 @@ import {
   INTERACTION_CONTINUATION_INFRA_RETRY_REASON,
   INTERACTION_CONTINUATION_INFRA_WAKE_REASON,
   heartbeatService,
+  mergeCoalescedContextSnapshot,
   redactDetectedSuccessfulRunProgressSummaryForBoard,
 } from "../services/heartbeat.ts";
 import {
@@ -795,6 +796,13 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
   async function seedInReviewParticipantRunFixture(input?: {
     wakeReason?: string;
     retryReason?: string | null;
+    stageType?: "review" | "approval";
+    timerHeartbeatEnabled?: boolean;
+    timerSkipsWhenNoActionableWork?: boolean;
+    timerMaxDailyRuns?: number;
+    timerMaxDailyCostCents?: number;
+    monitorNextCheckAt?: Date | null;
+    openBlocker?: boolean;
   }) {
     const companyId = randomUUID();
     const agentId = randomUUID();
@@ -804,7 +812,10 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     const stageId = randomUUID();
     const now = new Date("2026-03-19T00:00:00.000Z");
     const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
-    const wakeReason = input?.wakeReason ?? "execution_review_requested";
+    const stageType = input?.stageType ?? "review";
+    const wakeReason = input?.wakeReason ?? (
+      stageType === "approval" ? "execution_approval_requested" : "execution_review_requested"
+    );
 
     await db.insert(companies).values({
       id: companyId,
@@ -822,7 +833,18 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       status: "idle",
       adapterType: "codex_local",
       adapterConfig: {},
-      runtimeConfig: {},
+      runtimeConfig: input?.timerHeartbeatEnabled
+        ? {
+            heartbeat: {
+              enabled: true,
+              intervalSec: 3_600,
+              wakeOnDemand: true,
+              skipTimerWhenNoActionableWork: input.timerSkipsWhenNoActionableWork ?? false,
+              maxDailyRuns: input.timerMaxDailyRuns,
+              maxDailyCostCents: input.timerMaxDailyCostCents,
+            },
+          }
+        : {},
       permissions: {},
     });
 
@@ -855,6 +877,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         issueId,
         taskId: issueId,
         wakeReason,
+        executionStage: { stageId, stageType },
         ...(input?.retryReason ? { retryReason: input.retryReason } : {}),
       },
       updatedAt: now,
@@ -871,6 +894,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       executionRunId: runId,
       executionAgentNameKey: "codexreviewer",
       executionLockedAt: now,
+      monitorNextCheckAt: input?.monitorNextCheckAt ?? null,
       responsibleUserId: "responsible-user",
       issueNumber: 1,
       identifier: `${issuePrefix}-1`,
@@ -878,7 +902,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         status: "pending",
         currentStageId: stageId,
         currentStageIndex: 0,
-        currentStageType: "review",
+        currentStageType: stageType,
         currentParticipant: { type: "agent", agentId, userId: null },
         returnAssignee: { type: "agent", agentId, userId: null },
         reviewRequest: null,
@@ -887,6 +911,27 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         lastDecisionOutcome: null,
       },
     });
+
+    if (input?.openBlocker) {
+      const blockerIssueId = randomUUID();
+      await db.insert(issues).values({
+        id: blockerIssueId,
+        companyId,
+        title: "Pending approval prerequisite",
+        status: "blocked",
+        priority: "medium",
+        assigneeAgentId: agentId,
+        responsibleUserId: "responsible-user",
+        issueNumber: 2,
+        identifier: `${issuePrefix}-2`,
+      });
+      await db.insert(issueRelations).values({
+        companyId,
+        issueId: blockerIssueId,
+        relatedIssueId: issueId,
+        type: "blocks",
+      });
+    }
 
     return { companyId, agentId, runId, wakeupRequestId, issueId, stageId };
   }
@@ -3726,6 +3771,324 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(retryRun?.contextSnapshot as Record<string, unknown>).not.toHaveProperty("modelProfile");
   });
 
+  it("does not re-enqueue a successful review participant with a monitor", async () => {
+    const { agentId, issueId, runId, wakeupRequestId } =
+      await seedInReviewParticipantRunFixture({
+        monitorNextCheckAt: new Date("2099-03-19T00:00:00.000Z"),
+      });
+    const finishedAt = new Date("2026-03-19T00:05:00.000Z");
+    await db
+      .update(heartbeatRuns)
+      .set({
+        status: "succeeded",
+        startedAt: new Date("2026-03-19T00:00:00.000Z"),
+        finishedAt,
+        updatedAt: finishedAt,
+      })
+      .where(eq(heartbeatRuns.id, runId));
+    await db
+      .update(agentWakeupRequests)
+      .set({ status: "completed", finishedAt, updatedAt: finishedAt })
+      .where(eq(agentWakeupRequests.id, wakeupRequestId));
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    expect(result.reviewParticipantRequeued).toBe(0);
+    expect(result.escalated).toBe(0);
+    expect(result.issueIds).toEqual([]);
+    const runs = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    expect(runs).toHaveLength(1);
+    const issue = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(issue).toMatchObject({
+      status: "in_review",
+      assigneeAgentId: agentId,
+      monitorNextCheckAt: new Date("2099-03-19T00:00:00.000Z"),
+    });
+  });
+
+  it("does not re-enqueue a successful approval participant holding an asynchronous gate", async () => {
+    const { agentId, issueId, runId, wakeupRequestId } =
+      await seedInReviewParticipantRunFixture({
+        stageType: "approval",
+        timerHeartbeatEnabled: true,
+      });
+    const finishedAt = new Date("2026-03-19T00:05:00.000Z");
+    await db
+      .update(heartbeatRuns)
+      .set({
+        status: "succeeded",
+        startedAt: new Date("2026-03-19T00:00:00.000Z"),
+        finishedAt,
+        updatedAt: finishedAt,
+      })
+      .where(eq(heartbeatRuns.id, runId));
+    await db
+      .update(agentWakeupRequests)
+      .set({
+        status: "completed",
+        finishedAt,
+        updatedAt: finishedAt,
+      })
+      .where(eq(agentWakeupRequests.id, wakeupRequestId));
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    expect(result.reviewParticipantRequeued).toBe(0);
+    expect(result.escalated).toBe(0);
+    expect(result.issueIds).toEqual([]);
+    const runs = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    expect(runs).toHaveLength(1);
+    const issue = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(issue).toMatchObject({
+      status: "in_review",
+      assigneeAgentId: agentId,
+    });
+  });
+
+  it("still re-enqueues a failed approval participant", async () => {
+    const { agentId, issueId, runId, wakeupRequestId } =
+      await seedInReviewParticipantRunFixture({ stageType: "approval" });
+    const finishedAt = new Date("2026-03-19T00:05:00.000Z");
+    await db
+      .update(heartbeatRuns)
+      .set({
+        status: "failed",
+        startedAt: new Date("2026-03-19T00:00:00.000Z"),
+        finishedAt,
+        updatedAt: finishedAt,
+        errorCode: "process_lost",
+        error: "approval participant process exited unexpectedly",
+      })
+      .where(eq(heartbeatRuns.id, runId));
+    await db
+      .update(agentWakeupRequests)
+      .set({
+        status: "failed",
+        finishedAt,
+        updatedAt: finishedAt,
+      })
+      .where(eq(agentWakeupRequests.id, wakeupRequestId));
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    expect(result.reviewParticipantRequeued).toBe(1);
+    expect(result.escalated).toBe(0);
+    expect(result.issueIds).toEqual([issueId]);
+    const runs = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    const retryRun = runs.find((row) => row.id !== runId);
+    expect(retryRun?.contextSnapshot).toMatchObject({
+      issueId,
+      retryReason: "execution_review_participant_recovery",
+      currentStageType: "approval",
+    });
+  });
+
+  it("uses current stage metadata after a review wake is coalesced with a generic wake", async () => {
+    const { agentId, issueId, runId, wakeupRequestId, stageId } =
+      await seedInReviewParticipantRunFixture();
+    const finishedAt = new Date("2026-03-19T00:05:00.000Z");
+    await db
+      .update(heartbeatRuns)
+      .set({
+        status: "failed",
+        contextSnapshot: mergeCoalescedContextSnapshot(
+          {
+            issueId,
+            taskId: issueId,
+            wakeReason: "execution_review_requested",
+            executionStage: { stageId, stageType: "review" },
+          },
+          { issueId, taskId: issueId, wakeReason: "issue_commented" },
+        ),
+        startedAt: new Date("2026-03-19T00:00:00.000Z"),
+        finishedAt,
+        updatedAt: finishedAt,
+        errorCode: "process_lost",
+      })
+      .where(eq(heartbeatRuns.id, runId));
+    await db
+      .update(agentWakeupRequests)
+      .set({ status: "failed", finishedAt, updatedAt: finishedAt })
+      .where(eq(agentWakeupRequests.id, wakeupRequestId));
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    expect(result.reviewParticipantRequeued).toBe(1);
+    expect(result.issueIds).toEqual([issueId]);
+    const runs = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    const retryRun = runs.find((row) => row.id !== runId);
+    expect(retryRun).toMatchObject({ retryOfRunId: runId });
+    expect(retryRun?.contextSnapshot).toMatchObject({
+      currentStageId: stageId,
+      retryReason: "execution_review_participant_recovery",
+    });
+  });
+
+  it("re-enqueues a successful approval participant without a durable next-check path", async () => {
+    const { agentId, issueId, runId, wakeupRequestId } =
+      await seedInReviewParticipantRunFixture({ stageType: "approval" });
+    const finishedAt = new Date("2026-03-19T00:05:00.000Z");
+    await db
+      .update(heartbeatRuns)
+      .set({
+        status: "succeeded",
+        startedAt: new Date("2026-03-19T00:00:00.000Z"),
+        finishedAt,
+        updatedAt: finishedAt,
+      })
+      .where(eq(heartbeatRuns.id, runId));
+    await db
+      .update(agentWakeupRequests)
+      .set({ status: "completed", finishedAt, updatedAt: finishedAt })
+      .where(eq(agentWakeupRequests.id, wakeupRequestId));
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    expect(result.reviewParticipantRequeued).toBe(1);
+    const runs = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    const retryRun = runs.find((row) => row.id !== runId);
+    expect(retryRun?.contextSnapshot).toMatchObject({
+      issueId,
+      retryReason: "execution_review_participant_recovery",
+      currentStageType: "approval",
+    });
+  });
+
+  it("does not treat a timer that suppresses in-review-only work as a durable approval hold", async () => {
+    const { issueId, runId, wakeupRequestId } =
+      await seedInReviewParticipantRunFixture({
+        stageType: "approval",
+        timerHeartbeatEnabled: true,
+        timerSkipsWhenNoActionableWork: true,
+      });
+    const finishedAt = new Date("2026-03-19T00:05:00.000Z");
+    await db
+      .update(heartbeatRuns)
+      .set({ status: "succeeded", finishedAt, updatedAt: finishedAt })
+      .where(eq(heartbeatRuns.id, runId));
+    await db
+      .update(agentWakeupRequests)
+      .set({ status: "completed", finishedAt, updatedAt: finishedAt })
+      .where(eq(agentWakeupRequests.id, wakeupRequestId));
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    expect(result.reviewParticipantRequeued).toBe(1);
+    expect(result.issueIds).toEqual([issueId]);
+  });
+
+  it.each([
+    ["run", { timerMaxDailyRuns: 0 }],
+    ["cost", { timerMaxDailyCostCents: 0 }],
+  ] as const)(
+    "does not treat a timer with a permanent daily %s cap as a durable approval hold",
+    async (_capKind, timerCap) => {
+      const { issueId, runId, wakeupRequestId } =
+        await seedInReviewParticipantRunFixture({
+          stageType: "approval",
+          timerHeartbeatEnabled: true,
+          ...timerCap,
+        });
+      const finishedAt = new Date("2026-03-19T00:05:00.000Z");
+      await db
+        .update(heartbeatRuns)
+        .set({ status: "succeeded", finishedAt, updatedAt: finishedAt })
+        .where(eq(heartbeatRuns.id, runId));
+      await db
+        .update(agentWakeupRequests)
+        .set({ status: "completed", finishedAt, updatedAt: finishedAt })
+        .where(eq(agentWakeupRequests.id, wakeupRequestId));
+      const heartbeat = heartbeatService(db);
+
+      const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+      expect(result.reviewParticipantRequeued).toBe(0);
+      expect(result.escalated).toBe(1);
+      expect(result.issueIds).toEqual([issueId]);
+    },
+  );
+
+  it("uses the current approval stage run even after a later generic success", async () => {
+    const { companyId, agentId, issueId, runId, wakeupRequestId } =
+      await seedInReviewParticipantRunFixture({
+        stageType: "approval",
+        monitorNextCheckAt: new Date("2099-03-19T00:00:00.000Z"),
+      });
+    const failedAt = new Date("2026-03-19T00:05:00.000Z");
+    await db
+      .update(heartbeatRuns)
+      .set({
+        status: "failed",
+        startedAt: new Date("2026-03-19T00:00:00.000Z"),
+        finishedAt: failedAt,
+        updatedAt: failedAt,
+        errorCode: "process_lost",
+      })
+      .where(eq(heartbeatRuns.id, runId));
+    await db
+      .update(agentWakeupRequests)
+      .set({ status: "failed", finishedAt: failedAt, updatedAt: failedAt })
+      .where(eq(agentWakeupRequests.id, wakeupRequestId));
+    const genericRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: genericRunId,
+      companyId,
+      agentId,
+      invocationSource: "manual",
+      triggerDetail: "manual",
+      status: "succeeded",
+      startedAt: new Date("2026-03-19T00:06:00.000Z"),
+      finishedAt: new Date("2026-03-19T00:07:00.000Z"),
+      contextSnapshot: { issueId, taskId: issueId, wakeReason: "manual" },
+      updatedAt: new Date("2026-03-19T00:07:00.000Z"),
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    expect(result.reviewParticipantRequeued).toBe(1);
+    const runs = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    const retryRun = runs.find((row) =>
+      row.id !== runId &&
+      row.id !== genericRunId &&
+      (row.contextSnapshot as Record<string, unknown> | null)?.retryReason ===
+        "execution_review_participant_recovery"
+    );
+    expect(retryRun?.retryOfRunId).toBe(runId);
+  });
+
   it("re-enqueues a stranded execution-review participant when another agent has the latest issue run", async () => {
     const { companyId, agentId, issueId, runId, wakeupRequestId, stageId } =
       await seedInReviewParticipantRunFixture();
@@ -3948,6 +4311,318 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(issue?.status).toBe("in_review");
     expect(issue?.assigneeAgentId).toBe(agentId);
   });
+
+  it("does not immediately recover a successful approval participant holding an asynchronous gate", async () => {
+    const { agentId, issueId, runId } = await seedInReviewParticipantRunFixture({
+      stageType: "approval",
+      timerHeartbeatEnabled: true,
+    });
+    const heartbeat = heartbeatService(db);
+
+    await heartbeat.resumeQueuedRuns();
+    const settledRun = await waitForRunToSettle(heartbeat, runId, 8_000);
+    expect(settledRun?.status).toBe("succeeded");
+
+    const runs = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    expect(runs).toHaveLength(1);
+    expect(runs.some((row) =>
+      (row.contextSnapshot as Record<string, unknown> | null)?.retryReason ===
+        "execution_review_participant_recovery"
+    )).toBe(false);
+    const issue = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(issue).toMatchObject({
+      status: "in_review",
+      assigneeAgentId: agentId,
+    });
+  });
+
+  it("recovers a failed approval participant despite a persisted monitor during finalization", async () => {
+    mockAdapterExecute.mockResolvedValueOnce({
+      exitCode: 1,
+      signal: null,
+      timedOut: false,
+      errorCode: "adapter_failed",
+      errorMessage: "Approval participant failed before recording a decision.",
+      provider: "test",
+      model: "test-model",
+    });
+    const { companyId, agentId, issueId, runId, stageId } =
+      await seedInReviewParticipantRunFixture({
+        stageType: "approval",
+        monitorNextCheckAt: new Date("2099-03-19T00:00:00.000Z"),
+      });
+    await db
+      .update(heartbeatRuns)
+      .set({
+        contextSnapshot: {
+          issueId,
+          taskId: issueId,
+          wakeReason: "execution_approval_requested",
+          executionStage: { stageId, stageType: "approval" },
+          skipIssueComment: true,
+        },
+      })
+      .where(eq(heartbeatRuns.id, runId));
+    const heartbeat = heartbeatService(db);
+
+    await heartbeat.resumeQueuedRuns();
+    const settledRun = await waitForRunToSettle(heartbeat, runId);
+    expect(settledRun?.status).toBe("failed");
+
+    const recoveryRun = await waitForValue(async () => {
+      const runs = await db
+        .select()
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.agentId, agentId));
+      return runs.find((row) =>
+        row.id !== runId &&
+          (row.contextSnapshot as Record<string, unknown> | null)?.retryReason ===
+            "execution_review_participant_recovery"
+      ) ?? null;
+    });
+
+    expect(recoveryRun).toMatchObject({
+      companyId,
+      agentId,
+      retryOfRunId: runId,
+    });
+    expect(recoveryRun?.contextSnapshot).toMatchObject({
+      issueId,
+      currentStageType: "approval",
+    });
+  });
+
+  it.each(["timer", "monitor", "blocker"] as const)(
+    "blocks after a successful approval recovery with a %s path during finalization",
+    async (pathKind) => {
+      let releaseAdapter: (() => void) | null = null;
+      const adapterStarted = new Promise<void>((resolve) => {
+        mockAdapterExecute.mockImplementationOnce(async () => {
+          resolve();
+          await new Promise<void>((release) => {
+            releaseAdapter = release;
+          });
+          return {
+            exitCode: 0,
+            signal: null,
+            timedOut: false,
+            errorMessage: null,
+            summary: "Approval recovery remains pending.",
+            provider: "test",
+            model: "test-model",
+          };
+        });
+      });
+      const { companyId, agentId, issueId, runId } =
+        await seedInReviewParticipantRunFixture({
+          wakeReason: "execution_review_participant_recovery",
+          retryReason: "execution_review_participant_recovery",
+          stageType: "approval",
+          timerHeartbeatEnabled: pathKind === "timer",
+        });
+      const heartbeat = heartbeatService(db);
+
+      await heartbeat.resumeQueuedRuns();
+      await adapterStarted;
+      if (pathKind === "monitor") {
+        await db
+          .update(issues)
+          .set({ monitorNextCheckAt: new Date("2099-03-19T00:00:00.000Z") })
+          .where(eq(issues.id, issueId));
+      } else if (pathKind === "blocker") {
+        const blockerIssueId = randomUUID();
+        const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+        await db.insert(issues).values({
+          id: blockerIssueId,
+          companyId,
+          title: "Pending approval prerequisite",
+          status: "blocked",
+          priority: "medium",
+          assigneeAgentId: agentId,
+          responsibleUserId: "responsible-user",
+          issueNumber: 2,
+          identifier: `${issuePrefix}-2`,
+        });
+        await db.insert(issueRelations).values({
+          companyId,
+          issueId: blockerIssueId,
+          relatedIssueId: issueId,
+          type: "blocks",
+        });
+      }
+      if (!releaseAdapter) throw new Error("Adapter release handle was not captured");
+      releaseAdapter();
+      const settledRun = await waitForRunToSettle(heartbeat, runId, 8_000);
+      expect(settledRun?.status).toBe("succeeded");
+
+      const sourceIssue = await waitForValue(async () => {
+        const issue = await db
+          .select()
+          .from(issues)
+          .where(eq(issues.id, issueId))
+          .then((rows) => rows[0] ?? null);
+        return issue?.status === "blocked" ? issue : null;
+      }, 8_000);
+      expect(sourceIssue).toMatchObject({
+        status: "blocked",
+        assigneeAgentId: agentId,
+      });
+      if (pathKind === "blocker") {
+        const action = await waitForValue(async () =>
+          db
+            .select()
+            .from(issueRecoveryActions)
+            .where(and(
+              eq(issueRecoveryActions.sourceIssueId, issueId),
+              eq(issueRecoveryActions.cause, "execution_review_participant_recovery"),
+            ))
+            .then((rows) => rows[0] ?? null)
+        );
+        expect(action?.evidence).toMatchObject({ latestRunId: runId });
+        await waitForHeartbeatIdle(db);
+      } else {
+        await expectSourceScopedStrandedRecoveryAction({
+          companyId,
+          agentId,
+          issueId,
+          runId,
+          previousStatus: "in_review",
+          retryReason: "execution_review_participant_recovery",
+          cause: "execution_review_participant_recovery",
+        });
+      }
+    },
+  );
+
+  it.each(["maxDailyRuns", "maxDailyCostCents"] as const)(
+    "immediately recovers a successful approval participant when %s becomes zero",
+    async (capKey) => {
+      let releaseAdapter: (() => void) | null = null;
+      const adapterStarted = new Promise<void>((resolve) => {
+        mockAdapterExecute.mockImplementationOnce(async () => {
+          resolve();
+          await new Promise<void>((release) => {
+            releaseAdapter = release;
+          });
+          return {
+            exitCode: 0,
+            signal: null,
+            timedOut: false,
+            errorMessage: null,
+            summary: "Approval remains pending.",
+            provider: "test",
+            model: "test-model",
+          };
+        });
+      });
+      const { agentId, issueId, runId } = await seedInReviewParticipantRunFixture({
+        stageType: "approval",
+        timerHeartbeatEnabled: true,
+      });
+      const heartbeat = heartbeatService(db);
+
+      await heartbeat.resumeQueuedRuns();
+      await adapterStarted;
+      await db
+        .update(agents)
+        .set({
+          runtimeConfig: {
+            heartbeat: {
+              enabled: true,
+              intervalSec: 3_600,
+              wakeOnDemand: true,
+              [capKey]: 0,
+            },
+          },
+        })
+        .where(eq(agents.id, agentId));
+      if (!releaseAdapter) throw new Error("Adapter release handle was not captured");
+      releaseAdapter();
+      const settledRun = await waitForRunToSettle(heartbeat, runId, 8_000);
+      expect(settledRun?.status).toBe("succeeded");
+
+      const reviewRecoveryRun = await waitForValue(async () => {
+        const runs = await db
+          .select()
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.agentId, agentId));
+        return runs.find((row) =>
+          row.id !== runId &&
+          (row.contextSnapshot as Record<string, unknown> | null)?.retryReason ===
+            "execution_review_participant_recovery"
+        ) ?? null;
+      }, 8_000);
+
+      expect(reviewRecoveryRun?.contextSnapshot).toMatchObject({
+        issueId,
+        currentStageType: "approval",
+      });
+    },
+  );
+
+  it.each([
+    ["timer", { timerHeartbeatEnabled: true }],
+    ["monitor", { monitorNextCheckAt: new Date("2099-03-19T00:00:00.000Z") }],
+    ["blocker", { openBlocker: true }],
+  ] as const)(
+    "blocks after a successful approval recovery with a %s path during a direct sweep",
+    async (_pathKind, waitPath) => {
+      const { companyId, agentId, issueId, runId, wakeupRequestId } =
+        await seedInReviewParticipantRunFixture({
+          wakeReason: "execution_review_participant_recovery",
+          retryReason: "execution_review_participant_recovery",
+          stageType: "approval",
+          ...waitPath,
+        });
+      const finishedAt = new Date("2026-03-19T00:05:00.000Z");
+      await db
+        .update(heartbeatRuns)
+        .set({ status: "succeeded", finishedAt, updatedAt: finishedAt })
+        .where(eq(heartbeatRuns.id, runId));
+      await db
+        .update(agentWakeupRequests)
+        .set({ status: "completed", finishedAt, updatedAt: finishedAt })
+        .where(eq(agentWakeupRequests.id, wakeupRequestId));
+      const heartbeat = heartbeatService(db);
+
+      const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+      expect(result.reviewParticipantRequeued).toBe(0);
+      expect(result.escalated).toBe(1);
+      expect(result.issueIds).toEqual([issueId]);
+      if (_pathKind === "blocker") {
+        const action = await waitForValue(async () =>
+          db
+            .select()
+            .from(issueRecoveryActions)
+            .where(and(
+              eq(issueRecoveryActions.sourceIssueId, issueId),
+              eq(issueRecoveryActions.cause, "execution_review_participant_recovery"),
+            ))
+            .then((rows) => rows[0] ?? null)
+        );
+        expect(action?.evidence).toMatchObject({ latestRunId: runId });
+        await waitForHeartbeatIdle(db);
+      } else {
+        await expectSourceScopedStrandedRecoveryAction({
+          companyId,
+          agentId,
+          issueId,
+          runId,
+          previousStatus: "in_review",
+          retryReason: "execution_review_participant_recovery",
+          cause: "execution_review_participant_recovery",
+        });
+      }
+    },
+  );
 
   it("retries a pending execution-review participant once before blocking with a recovery action", async () => {
     const { companyId, agentId, issueId, runId, stageId } = await seedInReviewParticipantRunFixture();

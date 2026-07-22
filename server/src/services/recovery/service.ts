@@ -271,6 +271,17 @@ function isTerminalIssueRun(latestRun: LatestIssueRun) {
   return TERMINAL_HEARTBEAT_RUN_STATUSES.has(latestRun.status);
 }
 
+function isTerminalAutomaticRecoveryAttempt(
+  latestRun: LatestIssueRun,
+  expectedRetryReason: typeof EXECUTION_REVIEW_PARTICIPANT_RECOVERY_REASON,
+) {
+  if (!latestRun) return false;
+
+  const latestContext = parseObject(latestRun.contextSnapshot);
+  return readNonEmptyString(latestContext.retryReason) === expectedRetryReason &&
+    isTerminalIssueRun(latestRun);
+}
+
 const TRANSIENT_INFRA_CONTINUATION_ERROR_CODES = new Set<string>([
   "adapter_failed",
   "codex_transient_upstream",
@@ -724,11 +735,14 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       .then((rows) => rows[0] ?? null);
   }
 
-  async function getLatestIssueRunForAgent(
+  async function getLatestExecutionReviewStageRunForAgent(
     companyId: string,
     issueId: string,
     agentId: string,
+    stageId: string | null,
   ): Promise<LatestIssueRun> {
+    if (!stageId) return null;
+
     return db
       .select({
         id: heartbeatRuns.id,
@@ -746,11 +760,48 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           eq(heartbeatRuns.companyId, companyId),
           eq(heartbeatRuns.agentId, agentId),
           sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
+          or(
+            sql`${heartbeatRuns.contextSnapshot} -> 'executionStage' ->> 'stageId' = ${stageId}`,
+            sql`${heartbeatRuns.contextSnapshot} ->> 'currentStageId' = ${stageId}`,
+          ),
         ),
       )
       .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id))
       .limit(1)
       .then((rows) => rows[0] ?? null);
+  }
+
+  function hasPermanentHeartbeatDailyCap(agent: typeof agents.$inferSelect | null | undefined) {
+    const heartbeat = parseObject(parseObject(agent?.runtimeConfig).heartbeat);
+    const maxDailyRuns = heartbeat.maxDailyRuns ??
+      heartbeat.dailyRunLimit ??
+      heartbeat.dailyRunCap ??
+      heartbeat.maxRunsPerDay;
+    const maxDailyCostCents = heartbeat.maxDailyCostCents ??
+      heartbeat.dailyCostCentsLimit ??
+      heartbeat.dailySpendCentsLimit ??
+      heartbeat.dailyBudgetCents;
+    const isPermanentCap = (value: unknown) => {
+      if (value === null || value === undefined || value === "") return false;
+      return Math.floor(asNumber(value, 0)) === 0;
+    };
+    return isPermanentCap(maxDailyRuns) || isPermanentCap(maxDailyCostCents);
+  }
+
+  function hasEnabledTimerHeartbeat(agent: typeof agents.$inferSelect | null | undefined) {
+    const heartbeat = parseObject(parseObject(agent?.runtimeConfig).heartbeat);
+    const skipWhenNoActionableWork = asBoolean(
+      heartbeat.skipTimerWhenNoActionableWork ??
+        heartbeat.requireActionableTimerWork ??
+        heartbeat.issueOnlyTimer,
+      false,
+    );
+    return (
+      asBoolean(heartbeat.enabled, false) &&
+      asNumber(heartbeat.intervalSec, 0) > 0 &&
+      !skipWhenNoActionableWork &&
+      !hasPermanentHeartbeatDailyCap(agent)
+    );
   }
 
   async function summarizeRecentContinuationRetries(
@@ -3541,14 +3592,26 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       }
 
       let latestRun = await getLatestIssueRun(issue.companyId, issue.id);
-      if (latestRun?.status === "succeeded" && await hasPersistedDurableWaitPath(issue)) {
+      const participantLatestRunForRecovery = issue.status === "in_review" && participantAgentId
+        ? await getLatestExecutionReviewStageRunForAgent(
+          issue.companyId,
+          issue.id,
+          participantAgentId,
+          pendingExecutionState?.currentStageId ?? null,
+        )
+        : null;
+      const successfulRunWithDurableWait = issue.status === "in_review"
+        ? participantLatestRunForRecovery?.status === "succeeded" &&
+          !isTerminalAutomaticRecoveryAttempt(
+            participantLatestRunForRecovery,
+            EXECUTION_REVIEW_PARTICIPANT_RECOVERY_REASON,
+          )
+        : latestRun?.status === "succeeded";
+      if (successfulRunWithDurableWait && await hasPersistedDurableWaitPath(issue)) {
         result.skipped += 1;
         continue;
       }
       const recoveryNow = new Date();
-      const participantLatestRunForRecovery = issue.status === "in_review" && participantAgentId
-        ? await getLatestIssueRunForAgent(issue.companyId, issue.id, participantAgentId)
-        : null;
       const providerQuotaMonitorRun = issue.status === "in_review"
         ? participantLatestRunForRecovery
         : latestRun;
@@ -3739,6 +3802,22 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           continue;
         }
 
+        if (
+          pendingExecutionState.currentStageType === "approval" &&
+          participantLatestRun.status === "succeeded" &&
+          !isTerminalAutomaticRecoveryAttempt(
+            participantLatestRun,
+            EXECUTION_REVIEW_PARTICIPANT_RECOVERY_REASON,
+          ) &&
+          (
+            (agentInvokable && hasEnabledTimerHeartbeat(agent)) ||
+            await hasPersistedDurableWaitPath(issue)
+          )
+        ) {
+          result.skipped += 1;
+          continue;
+        }
+
         const participantAdapterFailureClassification = isUnsuccessfulTerminalIssueRun(participantLatestRun)
           ? classifyAdapterFailureForRecovery(participantLatestRun, recoveryNow)
           : null;
@@ -3785,7 +3864,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           continue;
         }
 
-        if (!agentInvokable) {
+        if (!agentInvokable || hasPermanentHeartbeatDailyCap(agent)) {
           const updated = await escalateStrandedAssignedIssue({
             issue,
             previousStatus: "in_review",
@@ -3803,7 +3882,12 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           continue;
         }
 
-        if (didAutomaticRecoveryFail(participantLatestRun, EXECUTION_REVIEW_PARTICIPANT_RECOVERY_REASON)) {
+        if (
+          isTerminalAutomaticRecoveryAttempt(
+            participantLatestRun,
+            EXECUTION_REVIEW_PARTICIPANT_RECOVERY_REASON,
+          )
+        ) {
           const updated = await escalateStrandedAssignedIssue({
             issue,
             previousStatus: "in_review",

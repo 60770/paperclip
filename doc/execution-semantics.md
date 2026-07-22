@@ -431,6 +431,8 @@ An `in_review` issue is stalled when it has no typed participant, no pending int
 
 When an execution-policy review stage has a pending agent participant, the participant's run is part of the review path only while it is live or queued. If that participant run reaches a terminal state while `executionState.status` remains `pending`, no decision has been recorded. Paperclip should queue one bounded normal-model recovery wake for the same participant when the agent is invokable and no other review path exists. If that recovery run also finishes while the stage remains pending, or the participant cannot be invoked, Paperclip must move the source issue to an explicit blocked/recovery path instead of leaving `in_review` to drift silently.
 
+Approval stages have a narrower recovery rule because an approver may intentionally withhold its decision while an asynchronous release, deployment, or external verification gate remains non-terminal. A successful approver run that leaves the approval stage pending is treated as an intentional hold only when Paperclip can prove a durable next-check path: an invokable approver with an enabled timer heartbeat that does not suppress `in_review`-only work, a persisted issue monitor, or a first-class blocker. A queued external-event wake remains a live path under the normal rule. Without one of those paths, the bounded participant recovery still applies; failed, timed-out, or cancelled approver runs always remain recovery-eligible so runtime failures do not strand the approval.
+
 ### Issue monitors
 
 An issue monitor is a one-shot deferred action path for agent-owned issues in `in_progress` or `in_review`.
