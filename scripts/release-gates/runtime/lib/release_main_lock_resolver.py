@@ -12,10 +12,13 @@ from urllib import error as urlerror
 from urllib import parse as urlparse
 from urllib import request as urlrequest
 
-RELEASE_BOT_AGENT_ID = "cf440f88-ba64-4173-80c3-371b44916c04"
 LOCK_PREFIX = "[MAIN_LOCKED]:"
 UNLOCK_PREFIX = "[MAIN_UNLOCKED]:"
 HTTP_TIMEOUT_SECONDS = 15
+UUID_PATTERN = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}",
+    re.ASCII | re.IGNORECASE,
+)
 LOCK_KEY_PATTERN = re.compile(r"(?:[A-Z][A-Z0-9]+-[0-9]+|NO-JIRA)", re.ASCII)
 IDENTIFIER_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]*", re.ASCII)
 TIMESTAMP_PATTERN = re.compile(
@@ -138,6 +141,10 @@ def is_valid_identifier(value: Any) -> bool:
     return isinstance(value, str) and IDENTIFIER_PATTERN.fullmatch(value) is not None
 
 
+def is_valid_uuid(value: Any) -> bool:
+    return isinstance(value, str) and UUID_PATTERN.fullmatch(value) is not None
+
+
 def is_non_empty_text(value: Any) -> bool:
     return isinstance(value, str) and bool(value.strip())
 
@@ -200,7 +207,7 @@ def collect_events(comments: list[Any]) -> list[MarkerEvent]:
 
 
 def resolve_active_lock(
-    events: list[MarkerEvent], client: PaperclipClient
+    events: list[MarkerEvent], client: PaperclipClient, release_bot_agent_id: str
 ) -> MarkerEvent | None:
     if not events:
         return None
@@ -218,7 +225,7 @@ def resolve_active_lock(
         if any(
             event.author_type == "agent"
             and event.author_user_id is None
-            and event.author_agent_id == RELEASE_BOT_AGENT_ID
+            and event.author_agent_id == release_bot_agent_id
             for event in unlocks
         ):
             return None
@@ -259,8 +266,11 @@ def main() -> int:
     api_url = os.environ.get("PAPERCLIP_API_URL")
     api_key_file = os.environ.get("PAPERCLIP_API_KEY_FILE")
     issue_identifier = os.environ.get("PAPERCLIP_MAIN_LOCK_ISSUE", "GOT-66")
-    if not api_url or not api_key_file or not issue_identifier:
+    release_bot_agent_id = os.environ.get("BROKER_RELEASE_BOT_AGENT_ID")
+    if not api_url or not api_key_file or not issue_identifier or not release_bot_agent_id:
         return emit_error("missing_configuration")
+    if not is_valid_uuid(release_bot_agent_id):
+        return emit_error("invalid_release_bot_agent_id")
 
     try:
         if os.path.islink(api_key_file) or not os.path.isfile(api_key_file):
@@ -271,7 +281,9 @@ def main() -> int:
             raise ResolverError("credential_file")
         client = PaperclipClient(api_url, api_key)
         comments = client.get_comments(issue_identifier)
-        active_lock = resolve_active_lock(collect_events(comments), client)
+        active_lock = resolve_active_lock(
+            collect_events(comments), client, release_bot_agent_id
+        )
     except ResolverError as exc:
         return emit_error(str(exc))
     except Exception:

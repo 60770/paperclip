@@ -244,6 +244,7 @@ def record_generation(path: Path, evidence: dict[str, object]) -> None:
     descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o444)
     try:
         os.write(descriptor, data.encode())
+        os.fchmod(descriptor, 0o444)
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
