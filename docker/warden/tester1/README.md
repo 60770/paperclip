@@ -127,6 +127,10 @@ unsafe runtime modes, non-builder image IDs, and drift before Compose or live
 file writes.
 `test-provision-secret-argv.sh` exercises new-environment and key-rotation
 provisioning with sentinel credentials and proves neither value enters argv.
+`test-egress-probe.sh` proves an HTTP response such as the Docker registry's
+401 is reachable traffic rather than a proxy deny. `test-runner-shell.sh`
+proves the boundary smoke forces legacy SCP and reaches the forced shell's SCP
+sink.
 
 ## Security boundary
 
@@ -276,13 +280,16 @@ PAPERCLIP_BOARD_PROFILE=tester1-provision \
 
 Delete the runtime file immediately after the probe and adapter test pass.
 
-## Runner supply chain
+## Warden supply chain
 
-The runner build uses immutable inputs:
+All four service builds use the immutable inputs recorded in
+`attestation/build-inputs.json`:
 
-- `node:24-bookworm-slim` is pinned to an OCI index digest in the Dockerfile;
-- Debian and Debian Security resolve through the dated snapshots in
-  `.warden/runner/debian.sources`, and every direct APT package pins a version;
+- every base image is pinned to a full OCI index digest;
+- the runner and egress proxy resolve Debian and Debian Security through dated
+  snapshots, and every direct APT package pins a version;
+- the Alpine sidecars fetch exact APK files with Dockerfile SHA-256 checksums,
+  then install only those files with networking and repositories disabled;
 - the exact Codex and Playwright MCP versions live in
   `.warden/runner/package.json`, while `package-lock.json` locks transitive
   packages and integrity hashes;
@@ -291,15 +298,17 @@ The runner build uses immutable inputs:
 
 To update the toolchain:
 
-1. Resolve the new official base digest with
-   `docker buildx imagetools inspect docker.io/library/node:24-bookworm-slim`,
-   review the upstream release, then update the Dockerfile digest.
-2. Advance both timestamps in `debian.sources` to a verified snapshot and
-   update the explicit APT versions from that same snapshot.
+1. Resolve each new official base digest with `docker buildx imagetools
+   inspect`, review the upstream release, then update the Dockerfile and build
+   input manifest together.
+2. Advance Debian snapshot timestamps and exact APT versions together. For an
+   Alpine package change, update the exact URL, version, and SHA-256 in both the
+   Dockerfile and manifest after reviewing the package closure.
 3. Change only exact dependency versions in `package.json`, then regenerate the
    lock with `npm install --package-lock-only --ignore-scripts --no-audit --no-fund --save-exact <packages>`.
-4. Run `./test-supply-chain-guard.sh`; it proves that mutable `FROM`, `npm
-   install`, or an omitted lockfile fail closed.
+4. Run `./test-supply-chain-guard.sh`; it proves that mutable `FROM`, manifest
+   drift, online APK installs, checksum drift, unpinned APT, mutable npm
+   installs, or an omitted lockfile fail closed.
 5. Refresh and commit the attestation, install the builder from that reviewed
    full commit, then rebuild with the privileged command above. Run the boundary smoke and
    `run-attested.sh --live-dir <path> -- ./audit-runner-image.sh <artifact-directory>`.
@@ -389,11 +398,13 @@ RUNNER_SSH_KEY_FILE=/dev/shm/tester1-runner/runner_ed25519 \
 
 `verify-no-docker-boundary.sh` needs no runner private key and is safe to run
 while Tester1 remains detached. It checks the live container policy, absent
-Docker control plane, negative egress, and qa-tunnel forwarding boundary.
+Docker control plane, negative egress before any origin HTTP response, and
+qa-tunnel forwarding boundary.
 
 The verifier owns the fixture lifecycle. It binds temporary QA fixtures only on
 host loopback ports 8223/8224, force-recreates the fixed reverse tunnel, copies
-the MCP client into the tmpfs workspace, and removes it before exit. It leaves
+the MCP client into the tmpfs workspace with legacy `scp -O`, and removes it
+before exit. It leaves
 `qa-tunnel` running for subsequent Paperclip runtime previews. The checks cover:
 
 - successful browser navigation to both local QA ports;

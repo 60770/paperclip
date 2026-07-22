@@ -208,7 +208,7 @@ echo "PASS tunnel_private_key_runtime_tmpfs_only image_without_private_key=true"
 ssh -p 2223 "${ssh_common_options[@]}" runner@127.0.0.1 \
   'curl --noproxy "*" --silent --fail --max-time 5 http://127.0.0.1:8223/health >/dev/null && curl --noproxy "*" --silent --fail --max-time 5 http://127.0.0.1:8224/health >/dev/null && rm -rf /workspace/playwright-mcp-smoke.mjs /workspace/.playwright-mcp'
 echo "PASS qa_reverse_tunnel_loopback_only"
-scp -P 2223 "${ssh_common_options[@]}" \
+scp -O -P 2223 "${ssh_common_options[@]}" \
   "${base_dir}/playwright-mcp-smoke.mjs" \
   runner@127.0.0.1:/workspace/playwright-mcp-smoke.mjs >/dev/null
 

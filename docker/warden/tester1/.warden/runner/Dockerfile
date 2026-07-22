@@ -43,6 +43,7 @@ RUN rm -rf /usr/local/lib/node_modules/npm /usr/local/bin/npm /usr/local/bin/npx
 COPY --chown=runner:runner authorized_keys /home/runner/.ssh/authorized_keys
 COPY codex-warden /usr/local/bin/codex-warden
 COPY --chown=runner:runner runner-shell.sh /home/runner/runner-shell.sh
+COPY verify-egress-denied.sh /usr/local/bin/verify-egress-denied
 COPY --chown=runner:runner tunnel-shell.sh /home/runner/tunnel-shell.sh
 COPY tunnel-authorized-key.sh /usr/local/bin/tunnel-authorized-key
 COPY qa-harness-profile.sh /etc/profile.d/qa-harness-path.sh
@@ -56,6 +57,7 @@ RUN chmod 0600 /home/runner/.ssh/authorized_keys \
     && chmod 0644 /home/runner/.ssh/ssh_host_ed25519_key.pub \
     && chmod 0555 /usr/local/bin/codex-warden \
     && chmod 0555 /home/runner/runner-shell.sh \
+    && chmod 0555 /usr/local/bin/verify-egress-denied \
     && chmod 0555 /home/runner/tunnel-shell.sh \
     && chmod 0555 /usr/local/bin/tunnel-authorized-key \
     && chmod 0444 /etc/profile.d/qa-harness-path.sh \

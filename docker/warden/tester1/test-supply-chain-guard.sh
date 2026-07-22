@@ -16,9 +16,10 @@ fail() {
 }
 
 reset_fixture() {
-  rm -rf -- "${TEMP_ROOT}/.warden"
-  mkdir -p "${TEMP_ROOT}/.warden"
-  cp -a "${ROOT_DIR}/.warden/runner" "${TEMP_ROOT}/.warden/runner"
+  rm -rf -- "${TEMP_ROOT}/.warden" "${TEMP_ROOT}/attestation"
+  cp -a "${ROOT_DIR}/.warden" "${TEMP_ROOT}/.warden"
+  mkdir -p "${TEMP_ROOT}/attestation"
+  cp "${ROOT_DIR}/attestation/build-inputs.json" "${TEMP_ROOT}/attestation/build-inputs.json"
   cp "${ROOT_DIR}/audit-runner-image.sh" "${TEMP_ROOT}/audit-runner-image.sh"
 }
 
@@ -55,6 +56,30 @@ printf 'PASS: every image rejects a short first attestation digest.\n'
 reset_fixture
 sed -i -E 's/@sha256:[0-9a-f]{64}//' "${TEMP_ROOT}/.warden/runner/Dockerfile"
 expect_guard_failure "mutable FROM"
+
+reset_fixture
+sed -i -E 's/@sha256:[0-9a-f]{64}//' "${TEMP_ROOT}/.warden/proxy/Dockerfile"
+expect_guard_failure "mutable proxy FROM"
+
+reset_fixture
+sed -i 's/squid=5.7-2+deb12u5/squid/' "${TEMP_ROOT}/.warden/proxy/Dockerfile"
+expect_guard_failure "unpinned proxy APT package"
+
+reset_fixture
+sed -i 's/0815a5f0403974bb9c34d456e71dc9c0222cb5455d393bc63c44b573da3d7fe0/1815a5f0403974bb9c34d456e71dc9c0222cb5455d393bc63c44b573da3d7fe0/' \
+  "${TEMP_ROOT}/.warden/qa-tunnel/Dockerfile"
+expect_guard_failure "qa-tunnel APK checksum drift"
+
+reset_fixture
+sed -i 's/--no-network --repositories-file \/dev\/null --allow-untrusted/--no-cache/' \
+  "${TEMP_ROOT}/.warden/ssh-proxy/Dockerfile"
+expect_guard_failure "online ssh-proxy APK install"
+
+reset_fixture
+jq '.services["egress-proxy"].baseImage = "debian:bookworm-slim@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"' \
+  "${TEMP_ROOT}/attestation/build-inputs.json" >"${TEMP_ROOT}/attestation/build-inputs.json.next"
+mv "${TEMP_ROOT}/attestation/build-inputs.json.next" "${TEMP_ROOT}/attestation/build-inputs.json"
+expect_guard_failure "build input manifest mismatch"
 
 reset_fixture
 sed -i 's/npm ci/npm install/' "${TEMP_ROOT}/.warden/runner/Dockerfile"

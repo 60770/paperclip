@@ -65,10 +65,10 @@ printf 'PASS runner_container_control_denied privileged=true devices=true host_b
 
 docker exec "${runner_container}" bash -lc '
   set -euo pipefail
-  ! env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY \
-    curl --noproxy "*" --silent --fail --max-time 5 https://example.com/ >/dev/null 2>&1
-  ! curl --silent --fail --max-time 10 https://example.com/ >/dev/null 2>&1
-  ! curl --silent --fail --max-time 10 https://registry-1.docker.io/v2/ >/dev/null 2>&1
+  env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY \
+    verify-egress-denied --noproxy "*" --max-time 5 https://example.com/ >/dev/null 2>&1
+  verify-egress-denied --max-time 10 https://example.com/ >/dev/null 2>&1
+  verify-egress-denied --max-time 10 https://registry-1.docker.io/v2/ >/dev/null 2>&1
   curl --silent --fail --max-time 15 https://estetia.tidycode.it/health >/dev/null
 '
 grep -qx 'http_access deny production' "${base_dir}/.warden/proxy/squid.conf" \
