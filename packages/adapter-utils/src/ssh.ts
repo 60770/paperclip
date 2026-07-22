@@ -395,8 +395,6 @@ async function createSshAuthArgs(
     "-o",
     "BatchMode=yes",
     "-o",
-    "IdentitiesOnly=yes",
-    "-o",
     "ConnectTimeout=10",
     "-o",
     `StrictHostKeyChecking=${config.strictHostKeyChecking ? "yes" : "no"}`,
@@ -415,7 +413,7 @@ async function createSshAuthArgs(
   if (config.privateKey) {
     const privateKey = await withTempFile("paperclip-ssh-key-", config.privateKey, 0o600);
     tempFiles.push(privateKey.cleanup);
-    sshArgs.push("-i", privateKey.path);
+    sshArgs.push("-o", "IdentitiesOnly=yes", "-i", privateKey.path);
   }
 
   return {

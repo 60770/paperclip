@@ -192,7 +192,7 @@ describe("ssh env-lab fixture", () => {
     ).rejects.toThrow("Invalid SSH environment variable key: BAD KEY");
   });
 
-  it("limits SSH authentication to the configured private key", async () => {
+  it("associates IdentitiesOnly with the materialized configured private key", async () => {
     const target = await buildSshSpawnTarget({
       spec: {
         host: "ssh.example.test",
@@ -210,11 +210,40 @@ describe("ssh env-lab fixture", () => {
     });
 
     try {
-      expect(target.args).toEqual(expect.arrayContaining([
+      const identityFileIndex = target.args.indexOf("-i");
+      expect(target.args.slice(identityFileIndex - 2, identityFileIndex + 1)).toEqual([
         "-o",
         "IdentitiesOnly=yes",
         "-i",
-      ]));
+      ]);
+      const identityFile = target.args[identityFileIndex + 1]!;
+      expect(identityFile).toMatch(/paperclip-ssh-key-/);
+      await expect(readFile(identityFile, "utf8")).resolves.toBe("test-private-key\n");
+    } finally {
+      await target.cleanup();
+    }
+  });
+
+  it("preserves default SSH identity fallback without a configured private key", async () => {
+    const target = await buildSshSpawnTarget({
+      spec: {
+        host: "ssh.example.test",
+        port: 22,
+        username: "ssh-user",
+        remoteCwd: "/srv/paperclip/workspace",
+        remoteWorkspacePath: "/srv/paperclip/workspace",
+        privateKey: null,
+        knownHosts: null,
+        strictHostKeyChecking: true,
+      },
+      command: "env",
+      args: [],
+      env: {},
+    });
+
+    try {
+      expect(target.args).not.toContain("IdentitiesOnly=yes");
+      expect(target.args).not.toContain("-i");
     } finally {
       await target.cleanup();
     }
@@ -366,6 +395,7 @@ describe("ssh env-lab fixture", () => {
     if (!started) return;
     const config = await buildSshEnvLabFixtureConfig(started);
     const spec = { ...config, remoteCwd: started.workspaceDir } as const;
+    await writeFile(started.sshdLogPath, "", "utf8");
 
     const lines: ParsedProgressLine[] = [];
     await prepareWorkspaceForSshExecution({
@@ -376,6 +406,9 @@ describe("ssh env-lab fixture", () => {
         lines.push(parseProgressLine(line));
       },
     });
+
+    const sshdLog = await readFile(started.sshdLogPath, "utf8");
+    expect(sshdLog).toContain(`Accepted publickey for ${started.username}`);
 
     const importLines = lines.filter((line) => line.raw.includes("Importing git history to ssh"));
     expect(importLines.length).toBeGreaterThan(0);
