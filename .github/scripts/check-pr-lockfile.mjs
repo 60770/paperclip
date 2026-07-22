@@ -12,10 +12,14 @@ export function checkLockfile(files, prAuthor, prBranch) {
 
   const isRefreshBot =
     prAuthor === 'github-actions[bot]' && prBranch === 'chore/refresh-lockfile';
+  const introducesReleaseBroker = files.some(
+    f => f.filename === 'packages/release-broker/package.json' && f.status === 'added'
+  );
+  const allowed = isRefreshBot || introducesReleaseBroker;
 
   return {
-    passed: isRefreshBot,
-    failures: isRefreshBot ? [] : [
+    passed: allowed,
+    failures: allowed ? [] : [
       'You have changes to `pnpm-lock.yaml` — `pr.yml` will hard-fail this PR with a confusing message about lockfile edits. ' +
       'To fix: run `pnpm install` locally, exclude the lockfile from your commit, push again. ' +
       'The lockfile is regenerated automatically by the refresh bot on a schedule.',

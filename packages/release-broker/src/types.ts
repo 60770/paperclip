@@ -81,6 +81,7 @@ export interface PaperclipInteraction {
 
 export interface GitLabPipeline {
   id: number;
+  sha: string;
   status: string;
   source: string;
   web_url?: string;
@@ -97,7 +98,7 @@ export interface GitLabMergeRequest {
   merge_status: string;
   has_conflicts: boolean;
   diverged_commits_count: number;
-  head_pipeline: { id: number; status: string } | null;
+  head_pipeline: { id: number; sha: string; status: string } | null;
   merge_commit_sha?: string | null;
   squash_commit_sha?: string | null;
 }

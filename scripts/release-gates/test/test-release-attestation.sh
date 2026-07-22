@@ -107,4 +107,10 @@ grep -Fq 'and (($completed | length) == 1)' \
   exit 1
 }
 
+grep -Fq 'CI=1 NODE_ENV=development pnpm install --frozen-lockfile --lockfile-only' \
+  "$repo_root/scripts/release-gates/build-release-bundle.sh" || {
+  printf 'release bundle frozen-lockfile gate missing\n' >&2
+  exit 1
+}
+
 printf 'release attestation regression: ok\n'

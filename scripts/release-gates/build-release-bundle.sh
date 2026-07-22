@@ -36,6 +36,7 @@ cd "$repo_root"
   printf 'release bundles require a clean source tree\n' >&2
   exit 1
 }
+CI=1 NODE_ENV=development pnpm install --frozen-lockfile --lockfile-only
 source_commit="$(git rev-parse HEAD)"
 [[ "$source_commit" =~ ^[0-9a-f]{40}$ ]] || exit 1
 built_at="$(git show -s --format=%cI "$source_commit")"

@@ -222,7 +222,7 @@ function fakeMr() {
     merge_status: "can_be_merged",
     has_conflicts: false,
     diverged_commits_count: 0,
-    head_pipeline: { id: 1, status: "success" },
+    head_pipeline: { id: 1, sha: request().expectedHeadSha, status: "success" },
   };
 }
 
@@ -230,7 +230,9 @@ class FakeGitLab implements GitLabMerger {
   mergeCalls = 0;
 
   async getMergeRequest() { return fakeMr(); }
-  async getPipeline() { return { id: 1, status: "success", source: "merge_request_event" }; }
+  async getPipeline() {
+    return { id: 1, sha: request().expectedHeadSha, status: "success", source: "merge_request_event" };
+  }
   async merge(): Promise<MergeResult> {
     this.mergeCalls += 1;
     return {

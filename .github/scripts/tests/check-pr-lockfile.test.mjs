@@ -17,6 +17,22 @@ test('passes when lockfile changed by refresh bot on correct branch', () => {
   assert.equal(result.passed, true);
 });
 
+test('passes when the same PR introduces the release broker workspace', () => {
+  const result = checkLockfile([
+    { filename: 'pnpm-lock.yaml', status: 'modified' },
+    { filename: 'packages/release-broker/package.json', status: 'added' },
+  ], 'someuser', 'feature/release-broker');
+  assert.equal(result.passed, true);
+});
+
+test('fails when an existing release broker manifest changes with the lockfile', () => {
+  const result = checkLockfile([
+    { filename: 'pnpm-lock.yaml', status: 'modified' },
+    { filename: 'packages/release-broker/package.json', status: 'modified' },
+  ], 'someuser', 'fix/release-broker');
+  assert.equal(result.passed, false);
+});
+
 test('fails when lockfile changed by regular user', () => {
   const result = checkLockfile(makeFiles(['pnpm-lock.yaml']), 'someuser', 'fix/bug');
   assert.equal(result.passed, false);

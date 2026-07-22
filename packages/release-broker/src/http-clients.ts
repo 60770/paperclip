@@ -1,4 +1,5 @@
 import { BrokerError } from "./errors.js";
+import { isFullSha } from "./validation.js";
 import type {
   GitLabMergeRequest,
   GitLabMerger,
@@ -26,6 +27,11 @@ function string(value: unknown): string {
   if (typeof value !== "string" || value.length === 0) {
     throw new BrokerError("ambiguous_response", 503);
   }
+  return value;
+}
+
+function fullSha(value: unknown): string {
+  if (!isFullSha(value)) throw new BrokerError("ambiguous_response", 503);
   return value;
 }
 
@@ -268,11 +274,13 @@ export class GitLabApiClient implements GitLabMerger {
       target_branch: string(input.target_branch),
       source_branch: string(input.source_branch),
       title: string(input.title),
-      sha: string(input.sha),
+      sha: fullSha(input.sha),
       merge_status: string(input.merge_status),
       has_conflicts: boolean(input.has_conflicts),
       diverged_commits_count: nonNegativeInteger(input.diverged_commits_count),
-      head_pipeline: pipeline ? { id: positiveInteger(pipeline.id), status: string(pipeline.status) } : null,
+      head_pipeline: pipeline
+        ? { id: positiveInteger(pipeline.id), sha: fullSha(pipeline.sha), status: string(pipeline.status) }
+        : null,
       merge_commit_sha: input.merge_commit_sha === undefined ? null : nullableString(input.merge_commit_sha),
       squash_commit_sha: input.squash_commit_sha === undefined ? null : nullableString(input.squash_commit_sha),
     };
@@ -288,6 +296,7 @@ export class GitLabApiClient implements GitLabMerger {
     if (id !== pipelineId) throw new BrokerError("ambiguous_response", 503);
     return {
       id,
+      sha: fullSha(input.sha),
       status: string(input.status),
       source: string(input.source),
       web_url: typeof input.web_url === "string" ? input.web_url : undefined,

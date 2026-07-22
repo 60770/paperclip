@@ -20,6 +20,7 @@ Current implementation status:
 GitHub Actions owns `pnpm-lock.yaml`.
 
 - Do not commit `pnpm-lock.yaml` in pull requests.
+- One exception: the pull request that first adds `packages/release-broker/package.json` must commit its lockfile importer so release bundles can enforce frozen resolution.
 - Pull request CI validates dependency resolution when manifests change.
 - Pushes to `master` regenerate `pnpm-lock.yaml` with `pnpm install --lockfile-only --no-frozen-lockfile`, commit it back if needed, and then run verification with `--frozen-lockfile`.
 

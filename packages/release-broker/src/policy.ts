@@ -1,5 +1,5 @@
 import { BrokerError } from "./errors.js";
-import { isFullSha } from "./validation.js";
+import { isFullSha, isUuid } from "./validation.js";
 import type {
   AttestationEvidence,
   AttestationProvider,
@@ -17,7 +17,6 @@ const MR_LINE = /^MR: https:\/\/gitlab\.tidycode\.it\/tidycode\/TaIA\/-\/merge_r
 const REVIEW_TOKEN = /^APPROVED-REVIEW$/m;
 const QA_TOKEN = /^APPROVED-QA$/m;
 const WAIVER_TOKEN = /^APPROVED-QA-WAIVED: (\S(?:.*\S)?)$/m;
-const SECURITY_FINDING = /^(?:\s*[-*]\s*)?(?:BLOCKER|HIGH)(?:\s|:)/im;
 const FEATURE_JIRA_KEY = /^feature\/(TAIA-\d+)(?:-|$)/;
 const TITLE_JIRA_KEY = /\b(TAIA-\d+)\b/;
 const MAIN_LOCK = "[MAIN_LOCKED]:";
@@ -67,6 +66,49 @@ function isAfter(left: string, right: string): boolean {
 
 function isLive(comment: PaperclipComment): boolean {
   return comment.deletedAt === null;
+}
+
+function approvalLines(markdown: string): string[] {
+  const lines: string[] = [];
+  let fence: { marker: string; length: number } | null = null;
+  let quotedParagraph = false;
+
+  for (const line of markdown.split(/\r?\n/)) {
+    const trimmed = line.trimStart();
+    const fenceMatch = /^(`{3,}|~{3,})(.*)$/.exec(trimmed);
+    if (fence) {
+      if (
+        fenceMatch &&
+        fenceMatch[1]![0] === fence.marker &&
+        fenceMatch[1]!.length >= fence.length &&
+        fenceMatch[2]!.trim().length === 0
+      ) fence = null;
+      continue;
+    }
+    if (fenceMatch) {
+      fence = { marker: fenceMatch[1]![0]!, length: fenceMatch[1]!.length };
+      continue;
+    }
+    if (trimmed.startsWith(">")) {
+      quotedParagraph = trimmed.slice(1).trim().length > 0;
+      continue;
+    }
+    if (quotedParagraph) {
+      if (trimmed.length === 0) quotedParagraph = false;
+      continue;
+    }
+    lines.push(line);
+  }
+  return lines;
+}
+
+function hasSecurityFinding(lines: string[]): boolean {
+  return lines.some((line) => {
+    const withoutList = line
+      .replace(/^\s*(?:(?:[-*+]|\d+[.)])\s+)?/, "")
+      .replace(/[*_]/g, "");
+    return /^(?:BLOCKER|HIGH)(?:\s*(?::|[-–—])|\s+|$)/i.test(withoutList);
+  });
 }
 
 function assertAuthorShape(comment: PaperclipComment): void {
@@ -172,13 +214,15 @@ export class ReleasePolicy {
 
     let review = false;
     let qa = false;
+    const waiverAllowed = await this.#allowsQaWaiver(issue);
     const releaseBotMention = `(agent://${this.#config.releaseBotAgentId})`;
 
     for (const comment of comments.filter(isLive)) {
       const tokenKey = keyOf(comment);
       const target = markers.filter((marker) => compareKeys(keyOf(marker.comment), tokenKey) <= 0).at(-1);
       if (!target || target.iid !== expectedIid || comment.authorType !== "agent") continue;
-      if (!comment.body.includes(releaseBotMention)) continue;
+      const lines = approvalLines(comment.body);
+      if (!lines.some((line) => line.includes(releaseBotMention))) continue;
 
       const agent = await this.#paperclip.getAgent(comment.authorAgentId!);
       const isReviewer = agent.role === "engineer" && agent.urlKey.startsWith("reviewer");
@@ -187,17 +231,83 @@ export class ReleasePolicy {
       if (
         isReviewer &&
         comment.authorAgentId !== candidate.authorAgentId &&
-        REVIEW_TOKEN.test(comment.body) &&
-        !SECURITY_FINDING.test(comment.body)
+        lines.some((line) => REVIEW_TOKEN.test(line)) &&
+        !hasSecurityFinding(lines)
       ) {
         review = true;
       }
-      if (isTester && QA_TOKEN.test(comment.body)) qa = true;
-      const waiver = WAIVER_TOKEN.exec(comment.body);
-      if (isReviewer && waiver && waiver[1]!.trim().length >= 5) qa = true;
+      if (isTester && lines.some((line) => QA_TOKEN.test(line))) qa = true;
+      const waiver = lines.map((line) => WAIVER_TOKEN.exec(line)).find((match) => match !== null);
+      if (waiverAllowed && isReviewer && waiver && waiver[1]!.trim().length >= 5) qa = true;
     }
 
     if (!review || !qa) throw new BrokerError("paperclip_not_ready", 409);
+  }
+
+  async #allowsQaWaiver(issue: PaperclipIssue): Promise<boolean> {
+    const policy = record(issue.executionPolicy);
+    const state = record(issue.executionState);
+    const stages = policy && Array.isArray(policy.stages) ? policy.stages : [];
+    if (
+      policy?.mode !== "normal" ||
+      policy.commentRequired !== true ||
+      stages.length !== 2 ||
+      !state ||
+      state.status !== "pending"
+    ) return false;
+
+    const reviewStage = record(stages[0]);
+    const approvalStage = record(stages[1]);
+    const reviewParticipants = reviewStage && Array.isArray(reviewStage.participants)
+      ? reviewStage.participants.map(record)
+      : [];
+    const approvalParticipants = approvalStage && Array.isArray(approvalStage.participants)
+      ? approvalStage.participants.map(record)
+      : [];
+    if (
+      !reviewStage ||
+      reviewStage.type !== "review" ||
+      reviewStage.approvalsNeeded !== 1 ||
+      !isUuid(reviewStage.id) ||
+      reviewParticipants.length === 0 ||
+      reviewParticipants.some((participant) =>
+        !participant ||
+        participant.type !== "agent" ||
+        !isUuid(participant.id) ||
+        !isUuid(participant.agentId) ||
+        participant.userId !== null
+      ) ||
+      !approvalStage ||
+      approvalStage.type !== "approval" ||
+      approvalStage.approvalsNeeded !== 1 ||
+      !isUuid(approvalStage.id) ||
+      approvalParticipants.length !== 1 ||
+      approvalParticipants[0]?.type !== "agent" ||
+      !isUuid(approvalParticipants[0]?.id) ||
+      approvalParticipants[0]?.agentId !== this.#config.releaseBotAgentId ||
+      approvalParticipants[0]?.userId !== null
+    ) return false;
+
+    const currentParticipant = record(state.currentParticipant);
+    const completedStageIds = Array.isArray(state.completedStageIds) ? state.completedStageIds : [];
+    if (
+      state.currentStageId !== approvalStage.id ||
+      state.currentStageIndex !== 1 ||
+      state.currentStageType !== "approval" ||
+      currentParticipant?.type !== "agent" ||
+      currentParticipant.agentId !== this.#config.releaseBotAgentId ||
+      currentParticipant.userId !== null ||
+      completedStageIds.length !== 1 ||
+      completedStageIds[0] !== reviewStage.id ||
+      !isUuid(state.lastDecisionId) ||
+      state.lastDecisionOutcome !== "approved"
+    ) return false;
+
+    for (const participant of reviewParticipants) {
+      const agent = await this.#paperclip.getAgent(participant!.agentId as string);
+      if (agent.role !== "engineer" || !agent.urlKey.startsWith("reviewer")) return false;
+    }
+    return true;
   }
 
   async #mergeRequestJiraKey(request: CapabilityRequest): Promise<{ mr: GitLabMergeRequest; jiraKey: string }> {
@@ -213,6 +323,10 @@ export class ReleasePolicy {
     if (!isFullSha(mr.sha) || mr.sha !== expectedHeadSha) {
       throw new BrokerError("sha_mismatch", 409);
     }
+    if (mr.head_pipeline === null) throw new BrokerError("mr_not_ready", 409);
+    if (!isFullSha(mr.head_pipeline.sha) || mr.head_pipeline.sha !== expectedHeadSha) {
+      throw new BrokerError("sha_mismatch", 409);
+    }
     if (
       mr.state !== "opened" ||
       mr.draft ||
@@ -220,12 +334,14 @@ export class ReleasePolicy {
       mr.merge_status !== "can_be_merged" ||
       mr.has_conflicts ||
       mr.diverged_commits_count !== 0 ||
-      mr.head_pipeline === null ||
       mr.head_pipeline.status !== "success"
     ) {
       throw new BrokerError("mr_not_ready", 409);
     }
     const pipeline = await this.#gitlab.getPipeline(mr.head_pipeline.id);
+    if (!isFullSha(pipeline.sha) || pipeline.sha !== expectedHeadSha) {
+      throw new BrokerError("sha_mismatch", 409);
+    }
     if (
       pipeline.id !== mr.head_pipeline.id ||
       pipeline.status !== "success" ||
