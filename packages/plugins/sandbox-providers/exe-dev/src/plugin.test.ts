@@ -19,17 +19,20 @@ import plugin, { validateSshPrivateKey } from "./plugin.js";
 class MockChildProcess extends EventEmitter {
   stdout = new EventEmitter();
   stderr = new EventEmitter();
-  stdin = {
+  stdin = Object.assign(new EventEmitter(), {
+    destroyed: false,
+    writable: true,
     written: "" as string,
     ended: false,
-    write: (chunk: string) => {
+    write: (chunk: string, callback?: (error?: Error | null) => void) => {
       this.stdin.written += chunk;
+      callback?.();
       return true;
     },
     end: () => {
       this.stdin.ended = true;
     },
-  };
+  });
   kill = vi.fn();
 
   constructor(input: { code?: number; signal?: string | null; stdout?: string; stderr?: string }) {

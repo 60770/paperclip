@@ -4,6 +4,10 @@ import os from "node:os";
 import path from "node:path";
 import type { ProviderQuotaResult, QuotaWindow } from "@paperclipai/adapter-utils";
 import {
+  installChildProcessStdioErrorHandlers,
+  type ChildProcessStdioGuard,
+} from "@paperclipai/adapter-utils/child-process-stdio";
+import {
   classifyCodexAuthRefreshFailure,
   type CodexAuthRefreshFailureClass,
 } from "./parse.js";
@@ -478,8 +482,15 @@ class CodexRpcClient {
   private buffer = "";
   private pending = new Map<number, PendingRequest>();
   private stderr = "";
+  private stdioGuard: ChildProcessStdioGuard;
 
   constructor() {
+    this.stdioGuard = installChildProcessStdioErrorHandlers(this.proc, {
+      onUnexpectedError: ({ error, stream }) => {
+        this.rejectPending(new Error(`codex app-server ${stream} stream failed: ${error.message}`));
+        this.proc.kill("SIGTERM");
+      },
+    });
     this.proc.stdout.setEncoding("utf8");
     this.proc.stderr.setEncoding("utf8");
     this.proc.stdout.on("data", (chunk: string) => this.onStdout(chunk));
@@ -487,19 +498,20 @@ class CodexRpcClient {
       this.stderr += chunk;
     });
     this.proc.on("exit", () => {
-      for (const request of this.pending.values()) {
-        clearTimeout(request.timer);
-        request.reject(new Error(this.stderr.trim() || "codex app-server closed unexpectedly"));
-      }
-      this.pending.clear();
+      this.rejectPending(new Error(this.stderr.trim() || "codex app-server closed unexpectedly"));
     });
+    this.proc.on("close", () => this.stdioGuard.dispose());
     this.proc.on("error", (err: Error) => {
-      for (const request of this.pending.values()) {
-        clearTimeout(request.timer);
-        request.reject(err);
-      }
-      this.pending.clear();
+      this.rejectPending(err);
     });
+  }
+
+  private rejectPending(error: Error) {
+    for (const request of this.pending.values()) {
+      clearTimeout(request.timer);
+      request.reject(error);
+    }
+    this.pending.clear();
   }
 
   private onStdout(chunk: string) {
@@ -535,12 +547,23 @@ class CodexRpcClient {
         reject(new Error(`codex app-server timed out on ${method}`));
       }, timeoutMs);
       this.pending.set(id, { resolve, reject, timer });
-      this.proc.stdin.write(payload);
+      if (this.proc.stdin.destroyed || !this.proc.stdin.writable) {
+        this.pending.delete(id);
+        clearTimeout(timer);
+        reject(new Error("codex app-server stdin is not writable"));
+        return;
+      }
+      this.proc.stdin.write(payload, (error) => {
+        if (error) this.stdioGuard.handleError("stdin", error);
+      });
     });
   }
 
   private notify(method: string, params: Record<string, unknown> = {}) {
-    this.proc.stdin.write(JSON.stringify({ method, params }) + "\n");
+    if (this.proc.stdin.destroyed || !this.proc.stdin.writable) return;
+    this.proc.stdin.write(JSON.stringify({ method, params }) + "\n", (error) => {
+      if (error) this.stdioGuard.handleError("stdin", error);
+    });
   }
 
   async initialize() {

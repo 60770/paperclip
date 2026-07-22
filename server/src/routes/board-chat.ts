@@ -3,6 +3,7 @@ import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { installChildProcessStdioErrorHandlers } from "@paperclipai/adapter-utils/child-process-stdio";
 import type { Db } from "@paperclipai/db";
 import type { DeploymentMode } from "@paperclipai/shared";
 import { instanceSettingsService, issueService } from "../services/index.js";
@@ -260,6 +261,14 @@ export function boardChatRoutes(
     let fullResponse = "";
     let streamedViaDelta = false;
     let killed = false;
+    let stdioFailure: string | null = null;
+    const stdioGuard = installChildProcessStdioErrorHandlers(proc, {
+      onUnexpectedError: ({ error, stream }) => {
+        stdioFailure ??= `Board assistant ${stream} stream failed: ${error.message}`;
+        proc.kill("SIGTERM");
+        console.error("[board/chat/stream stdio error]", { stream, error });
+      },
+    });
 
     // 120s timeout — board conversations can involve multiple API calls.
     const timeout = setTimeout(() => {
@@ -353,6 +362,7 @@ export function boardChatRoutes(
     proc.on("close", async (exitCode) => {
       clearTimeout(timeout);
       releaseSlot();
+      stdioGuard.dispose();
 
       // Persist the board's reply under the "board-concierge" sentinel so the
       // UI renders it as an assistant bubble (see BoardChat `isUser` check).
@@ -368,14 +378,14 @@ export function boardChatRoutes(
       }
 
       if (res.writable) {
-        res.write(
-          `data: ${JSON.stringify({
-            type: "done",
-            issueId: resolvedIssueId,
-            exitCode: exitCode ?? 0,
-            timedOut: killed,
-          })}\n\n`,
-        );
+        res.write(`data: ${JSON.stringify(stdioFailure
+          ? { type: "error", message: stdioFailure }
+          : {
+              type: "done",
+              issueId: resolvedIssueId,
+              exitCode: exitCode ?? 0,
+              timedOut: killed,
+            })}\n\n`);
         res.end();
       }
     });
@@ -397,8 +407,15 @@ export function boardChatRoutes(
     });
 
     // Feed the prompt to the CLI via stdin.
-    proc.stdin.write(prompt);
-    proc.stdin.end();
+    if (!proc.stdin.destroyed && proc.stdin.writable) {
+      proc.stdin.write(prompt, (error) => {
+        if (error) {
+          stdioGuard.handleError("stdin", error);
+          return;
+        }
+        if (!proc.stdin.destroyed && proc.stdin.writable) proc.stdin.end();
+      });
+    }
   });
 
   return router;

@@ -5,6 +5,7 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { Transform } from "node:stream";
+import { installChildProcessStdioErrorHandlers } from "./child-process-stdio.js";
 import type { CommandManagedRuntimeRunner } from "./command-managed-runtime.js";
 import type { RunProcessResult } from "./server-utils.js";
 import type { DirectorySnapshot } from "./workspace-restore-merge.js";
@@ -243,6 +244,16 @@ async function spawnText(
       reject(error);
     };
 
+    const stdioGuard = installChildProcessStdioErrorHandlers(child, {
+      onUnexpectedError: ({ error, stream }) => {
+        finishReject(Object.assign(
+          new Error(`SSH ${stream} stream failed: ${error.message}`),
+          { code: null },
+        ));
+        child.kill("SIGTERM");
+      },
+    });
+
     const append = (
       streamName: "stdout" | "stderr",
       chunk: unknown,
@@ -300,6 +311,7 @@ async function spawnText(
 
     child.on("close", (code, signal) => {
       clearTimers();
+      stdioGuard.dispose();
       if (settled) return;
       settled = true;
       if (code === 0) {
@@ -316,7 +328,16 @@ async function spawnText(
     });
 
     if (options.stdin != null && child.stdin) {
-      child.stdin.end(options.stdin);
+      const stdin = child.stdin;
+      if (!stdin.destroyed && stdin.writable) {
+        stdin.write(options.stdin, (error) => {
+          if (error) {
+            stdioGuard.handleError("stdin", error);
+            return;
+          }
+          if (!settled && !stdin.destroyed && stdin.writable) stdin.end();
+        });
+      }
     }
   });
 }

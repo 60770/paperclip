@@ -1516,10 +1516,39 @@ const token = ${JSON.stringify(input.token)};
 let buffer = "";
 let exiting = false;
 
-function send(message) {
-  socket.write(JSON.stringify({ token, ...message }) + "\\n");
+function isPeerClosedError(error) {
+  return error && (error.code === "EPIPE" || error.code === "ECONNRESET");
 }
 
+function failStream(error) {
+  if (!error) return;
+  if (isPeerClosedError(error)) {
+    exiting = true;
+    socket.destroy();
+    return;
+  }
+  exiting = true;
+  process.exitCode = 1;
+  socket.destroy();
+}
+
+function send(message) {
+  if (socket.destroyed || !socket.writable) return;
+  socket.write(JSON.stringify({ token, ...message }) + "\\n", failStream);
+}
+
+function writeOutput(stream, data) {
+  if (stream.destroyed || !stream.writable) return;
+  stream.write(data, failStream);
+}
+
+for (const stream of [process.stdin, process.stdout, process.stderr]) {
+  stream.on("error", failStream);
+}
+socket.on("error", (error) => {
+  if (isPeerClosedError(error)) exiting = true;
+  else process.exitCode = 1;
+});
 socket.on("connect", () => send({ type: "hello" }));
 process.stdin.on("data", (chunk) => send({ type: "stdin", data: Buffer.from(chunk).toString("base64") }));
 process.stdin.on("end", () => send({ type: "stdinEnd" }));
@@ -1535,9 +1564,9 @@ socket.on("data", (chunk) => {
     const message = JSON.parse(line);
     if (message.type === "data") {
       const out = Buffer.from(message.data || "", "base64");
-      (message.stream === "stderr" ? process.stderr : process.stdout).write(out);
+      writeOutput(message.stream === "stderr" ? process.stderr : process.stdout, out);
     } else if (message.type === "error") {
-      process.stderr.write(String(message.message || "Process session bridge failed.") + "\\n");
+      writeOutput(process.stderr, String(message.message || "Process session bridge failed.") + "\\n");
       exiting = true;
       process.exitCode = 1;
       socket.end();
@@ -1567,6 +1596,7 @@ const stdinDir = path.posix.join(sessionDir, "stdin");
 const eventsDir = path.posix.join(sessionDir, "events");
 let seq = 0;
 let stdinClosed = false;
+let terminalEventWritten = false;
 
 const config = JSON.parse(Buffer.from(commandPayload, "base64").toString("utf8"));
 await fs.mkdir(stdinDir, { recursive: true });
@@ -1582,7 +1612,7 @@ function writeEvent(event) {
     await fs.rename(file + ".tmp", file);
   });
   writeChain = write.catch(() => undefined);
-  return write;
+  return writeChain;
 }
 
 const child = spawn(config.command, Array.isArray(config.args) ? config.args : [], {
@@ -1591,12 +1621,53 @@ const child = spawn(config.command, Array.isArray(config.args) ? config.args : [
   stdio: ["pipe", "pipe", "pipe"],
 });
 
+function isPeerClosedError(error) {
+  return error && (error.code === "EPIPE" || error.code === "ECONNRESET");
+}
+
+function handleStdioError(stream, error) {
+  if (isPeerClosedError(error)) {
+    if (stream === "stdin") stdinClosed = true;
+    return;
+  }
+  if (terminalEventWritten) return;
+  terminalEventWritten = true;
+  stdinClosed = true;
+  void writeEvent({ type: "error", message: stream + " stream failed: " + error.message });
+  if (child.exitCode === null && child.signalCode === null) child.kill("SIGTERM");
+}
+
+for (const stream of ["stdin", "stdout", "stderr"]) {
+  child[stream].on("error", (error) => handleStdioError(stream, error));
+}
 child.stdout.on("data", (chunk) => void writeEvent({ type: "data", stream: "stdout", data: Buffer.from(chunk).toString("base64") }));
 child.stderr.on("data", (chunk) => void writeEvent({ type: "data", stream: "stderr", data: Buffer.from(chunk).toString("base64") }));
-child.on("error", (error) => void writeEvent({ type: "error", message: error.message }));
+child.on("error", (error) => {
+  if (terminalEventWritten) return;
+  terminalEventWritten = true;
+  void writeEvent({ type: "error", message: error.message });
+});
 // "close" (not "exit") so stdout/stderr fully drain before the exit event;
 // the write chain then guarantees the exit file lands after every data file.
-child.on("close", (code, signal) => void writeEvent({ type: "exit", code, signal }));
+child.on("close", (code, signal) => {
+  if (terminalEventWritten) return;
+  terminalEventWritten = true;
+  void writeEvent({ type: "exit", code, signal });
+});
+
+function writeStdin(data) {
+  return new Promise((resolve) => {
+    if (child.stdin.destroyed || !child.stdin.writable) {
+      stdinClosed = true;
+      resolve();
+      return;
+    }
+    child.stdin.write(data, (error) => {
+      if (error) handleStdioError("stdin", error);
+      resolve();
+    });
+  });
+}
 
 async function pollStdin() {
   while (!stdinClosed) {
@@ -1608,10 +1679,10 @@ async function pollStdin() {
       if (!raw) continue;
       const message = JSON.parse(raw);
       if (message.type === "stdin" && typeof message.data === "string") {
-        child.stdin.write(Buffer.from(message.data, "base64"));
+        await writeStdin(Buffer.from(message.data, "base64"));
       } else if (message.type === "stdinEnd") {
         stdinClosed = true;
-        child.stdin.end();
+        if (!child.stdin.destroyed && child.stdin.writable) child.stdin.end();
         break;
       }
     }

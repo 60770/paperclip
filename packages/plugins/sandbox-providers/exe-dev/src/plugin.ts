@@ -2,7 +2,7 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 import { definePlugin } from "@paperclipai/plugin-sdk";
 import type {
   PluginEnvironmentAcquireLeaseParams,
@@ -70,6 +70,35 @@ const EXE_DEV_SSH_ONBOARDING_MARKER = "Please complete registration by running: 
 const EXE_DEV_SSH_EMAIL_PROMPT = "Please enter your email address:";
 const EXE_DEV_SSH_INVALID_KEY_FORMAT = /Load key [^\n]*invalid format/i;
 const UUID_SECRET_REF_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+function installChildProcessStdioErrorHandlers(
+  child: ChildProcess,
+  onUnexpectedError: (stream: "stdin" | "stdout" | "stderr", error: Error) => void,
+) {
+  const handleError = (stream: "stdin" | "stdout" | "stderr", error: Error) => {
+    if ((error as NodeJS.ErrnoException).code === "EPIPE" || (error as NodeJS.ErrnoException).code === "ECONNRESET") {
+      return;
+    }
+    try {
+      onUnexpectedError(stream, error);
+    } catch (handlerError) {
+      console.error("Child process stdio error handler failed", handlerError);
+    }
+  };
+  const listeners = (["stdin", "stdout", "stderr"] as const).flatMap((stream) => {
+    const target = child[stream];
+    if (!target) return [];
+    const listener = (error: Error) => handleError(stream, error);
+    target.on("error", listener);
+    return [{ target, listener }];
+  });
+  return {
+    handleError,
+    dispose: () => {
+      for (const { target, listener } of listeners) target.off("error", listener);
+    },
+  };
+}
 
 // exe.dev's `--setup-script` runs at VM init as the unprivileged `exedev` user, which
 // has passwordless sudo. The Paperclip sandbox callback bridge is a Node script, so
@@ -594,8 +623,21 @@ async function runSshCommand(
       });
       let stdout = "";
       let stderr = "";
+      let settled = false;
       let timedOut = false;
       let killTimer: NodeJS.Timeout | null = null;
+      const rejectOnce = (error: Error) => {
+        if (settled) return;
+        settled = true;
+        reject(error);
+      };
+      const stdioGuard = installChildProcessStdioErrorHandlers(
+        child,
+        (stream, error) => {
+          rejectOnce(new Error(`exe.dev SSH ${stream} stream failed: ${error.message}`));
+          child.kill("SIGTERM");
+        },
+      );
       const timer = timeoutMs > 0
         ? setTimeout(() => {
             timedOut = true;
@@ -615,11 +657,14 @@ async function runSshCommand(
       child.on("error", (error) => {
         if (timer) clearTimeout(timer);
         if (killTimer) clearTimeout(killTimer);
-        reject(error);
+        rejectOnce(error);
       });
       child.on("close", (code, signal) => {
         if (timer) clearTimeout(timer);
         if (killTimer) clearTimeout(killTimer);
+        stdioGuard.dispose();
+        if (settled) return;
+        settled = true;
         resolve({
           exitCode: timedOut ? null : code,
           signal,
@@ -630,8 +675,16 @@ async function runSshCommand(
       });
 
       if (options.stdin != null && child.stdin) {
-        child.stdin.write(options.stdin);
-        child.stdin.end();
+        const stdin = child.stdin;
+        if (!stdin.destroyed && stdin.writable) {
+          stdin.write(options.stdin, (error) => {
+            if (error) {
+              stdioGuard.handleError("stdin", error);
+              return;
+            }
+            if (!settled && !stdin.destroyed && stdin.writable) stdin.end();
+          });
+        }
       }
     });
   } finally {

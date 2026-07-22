@@ -3,6 +3,7 @@ import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
+import { installChildProcessStdioErrorHandlers } from "@paperclipai/adapter-utils/child-process-stdio";
 import { definePlugin } from "@paperclipai/plugin-sdk";
 import type {
   PluginEnvironmentAcquireLeaseParams,
@@ -211,8 +212,20 @@ async function runCommand(params: PluginEnvironmentExecuteParams, timeoutMs: num
     });
     let stdout = "";
     let stderr = "";
+    let settled = false;
     let timedOut = false;
     let killTimer: NodeJS.Timeout | null = null;
+    const rejectOnce = (error: Error) => {
+      if (settled) return;
+      settled = true;
+      reject(error);
+    };
+    const stdioGuard = installChildProcessStdioErrorHandlers(child, {
+      onUnexpectedError: ({ error, stream }) => {
+        rejectOnce(new Error(`Sandbox command ${stream} stream failed: ${error.message}`));
+        child.kill("SIGTERM");
+      },
+    });
     const timer = timeoutMs > 0
       ? setTimeout(() => {
           timedOut = true;
@@ -232,11 +245,14 @@ async function runCommand(params: PluginEnvironmentExecuteParams, timeoutMs: num
     child.on("error", (error) => {
       if (timer) clearTimeout(timer);
       if (killTimer) clearTimeout(killTimer);
-      reject(error);
+      rejectOnce(error);
     });
     child.on("close", (code, signal) => {
       if (timer) clearTimeout(timer);
       if (killTimer) clearTimeout(killTimer);
+      stdioGuard.dispose();
+      if (settled) return;
+      settled = true;
       resolve({
         exitCode: timedOut ? null : code,
         signal,
@@ -251,8 +267,16 @@ async function runCommand(params: PluginEnvironmentExecuteParams, timeoutMs: num
     });
 
     if (params.stdin != null && child.stdin) {
-      child.stdin.write(params.stdin);
-      child.stdin.end();
+      const stdin = child.stdin;
+      if (!stdin.destroyed && stdin.writable) {
+        stdin.write(params.stdin, (error) => {
+          if (error) {
+            stdioGuard.handleError("stdin", error);
+            return;
+          }
+          if (!settled && !stdin.destroyed && stdin.writable) stdin.end();
+        });
+      }
     }
   });
 }
