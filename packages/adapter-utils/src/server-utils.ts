@@ -3,6 +3,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { constants as fsConstants, promises as fs, type Dirent } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { installChildProcessStdioErrorHandlers } from "./child-process-stdio.js";
 import { sanitizeRemoteExecutionEnv } from "./remote-execution-env.js";
 import {
   buildLocalProcessSandboxSpawnTarget,
@@ -3066,20 +3067,13 @@ export async function runChildProcess(
         }) as ChildProcessWithEvents;
         const startedAt = new Date().toISOString();
         const processGroupId = resolveProcessGroupId(child);
-
-        const spawnPersistPromise =
-          typeof child.pid === "number" && child.pid > 0 && opts.onSpawn
-            ? opts.onSpawn({ pid: child.pid, processGroupId, startedAt }).catch((err) => {
-              onLogError(err, runId, "failed to record child process metadata");
-            })
-            : Promise.resolve();
-
-        runningProcesses.set(runId, { child, graceSec: opts.graceSec, processGroupId });
-
+        let settled = false;
         let timedOut = false;
         let stdout = "";
         let stderr = "";
         let logChain: Promise<void> = Promise.resolve();
+        let targetCleanupPromise: Promise<void> | null = null;
+        let timeout: NodeJS.Timeout | null = null;
         let terminalResultSeen = false;
         let terminalCleanupStarted = false;
         let terminalCleanupSignal: NodeJS.Signals | null = null;
@@ -3096,9 +3090,43 @@ export async function runChildProcess(
           terminalCleanupKillTimer = null;
         };
 
+        const cleanupTarget = () => {
+          targetCleanupPromise ??= Promise.resolve()
+            .then(() => target.cleanup?.())
+            .catch((err) => {
+              try {
+                onLogError(err, runId, "failed to clean up child process target");
+              } catch (handlerError) {
+                console.error("Child process cleanup error handler failed", handlerError);
+              }
+            });
+          return targetCleanupPromise;
+        };
+
+        const rejectOnce = (error: Error) => {
+          if (settled) return;
+          settled = true;
+          if (timeout) clearTimeout(timeout);
+          clearTerminalCleanupTimers();
+          runningProcesses.delete(runId);
+          void cleanupTarget().finally(() => reject(error));
+        };
+
+        const stdioGuard = installChildProcessStdioErrorHandlers(child, {
+          onUnexpectedError: ({ error, stream }) => {
+            rejectOnce(
+              new Error(`Child process ${stream} stream failed for command "${command}": ${error.message}`),
+            );
+            signalRunningProcess({ child, processGroupId }, "SIGTERM");
+            onLogError(error, runId, `child process ${stream} stream failed`);
+          },
+        });
+
+        runningProcesses.set(runId, { child, graceSec: opts.graceSec, processGroupId });
+
         const maybeArmTerminalResultCleanup = () => {
           const terminalCleanup = opts.terminalResultCleanup;
-          if (!terminalCleanup || terminalCleanupStarted || timedOut) return;
+          if (settled || !terminalCleanup || terminalCleanupStarted || timedOut) return;
           if (!terminalResultSeen) {
             const stdoutStart = Math.max(0, terminalResultStdoutScanOffset - TERMINAL_RESULT_SCAN_OVERLAP_CHARS);
             const stderrStart = Math.max(0, terminalResultStderrScanOffset - TERMINAL_RESULT_SCAN_OVERLAP_CHARS);
@@ -3134,7 +3162,7 @@ export async function runChildProcess(
           }, graceMs);
         };
 
-        const timeout =
+        timeout =
           opts.timeoutSec > 0
             ? setTimeout(() => {
                 timedOut = true;
@@ -3178,27 +3206,14 @@ export async function runChildProcess(
             });
         });
 
-        const stdin = child.stdin;
-        if (opts.stdin != null && stdin) {
-          void spawnPersistPromise.finally(() => {
-            if (child.killed || stdin.destroyed) return;
-            stdin.write(opts.stdin as string);
-            stdin.end();
-          });
-        }
-
         child.on("error", (err: Error) => {
-          if (timeout) clearTimeout(timeout);
-          clearTerminalCleanupTimers();
-          runningProcesses.delete(runId);
-          void target.cleanup?.();
           const errno = (err as NodeJS.ErrnoException).code;
           const pathValue = mergedEnv.PATH ?? mergedEnv.Path ?? "";
           const msg =
             errno === "ENOENT"
               ? `Failed to start command "${command}" in "${opts.cwd}". Verify adapter command, working directory, and PATH (${pathValue}).`
               : `Failed to start command "${command}" in "${opts.cwd}": ${err.message}`;
-          reject(new Error(msg));
+          rejectOnce(new Error(msg));
         });
 
         child.on("exit", () => {
@@ -3209,10 +3224,14 @@ export async function runChildProcess(
           if (timeout) clearTimeout(timeout);
           clearTerminalCleanupTimers();
           runningProcesses.delete(runId);
+          stdioGuard.dispose();
+          if (settled) {
+            void cleanupTarget();
+            return;
+          }
+          settled = true;
           void logChain.finally(() => {
-            void Promise.resolve()
-              .then(() => target.cleanup?.())
-              .finally(() => {
+            void cleanupTarget().finally(() => {
               resolve({
                 exitCode: code,
                 signal,
@@ -3233,9 +3252,30 @@ export async function runChildProcess(
                   }
                   : null,
               });
-              });
+            });
           });
         });
+
+        const spawnPersistPromise =
+          typeof child.pid === "number" && child.pid > 0 && opts.onSpawn
+            ? opts.onSpawn({ pid: child.pid, processGroupId, startedAt }).catch((err) => {
+              onLogError(err, runId, "failed to record child process metadata");
+            })
+            : Promise.resolve();
+
+        const stdin = child.stdin;
+        if (opts.stdin != null && stdin) {
+          void spawnPersistPromise.finally(() => {
+            if (settled || child.killed || stdin.destroyed || !stdin.writable) return;
+            stdin.write(opts.stdin as string, (error) => {
+              if (error) {
+                stdioGuard.handleError("stdin", error);
+                return;
+              }
+              if (!settled && !stdin.destroyed && stdin.writable) stdin.end();
+            });
+          });
+        }
       })
       .catch(reject);
   });

@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
+import { installChildProcessStdioErrorHandlers } from "@paperclipai/adapter-utils/child-process-stdio";
 import { and, desc, eq, inArray, isNull, lte, ne, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
@@ -2613,15 +2614,66 @@ export function createToolGatewayService(
       resolve: (value: unknown) => void;
       reject: (error: Error) => void;
     }>();
-    const timer = setTimeout(() => {
-      child.kill("SIGTERM");
-      for (const { reject } of pending.values()) {
-        reject(new ToolGatewayHttpError(504, "Local stdio MCP tool call timed out", "tool_timeout", {
+    let exitSettled = false;
+    let resolveExit: () => void = () => {};
+    let rejectExit: (error: Error) => void = () => {};
+    const exitPromise = new Promise<void>((resolve, reject) => {
+      resolveExit = resolve;
+      rejectExit = reject;
+    });
+    const settleExit = (error?: Error) => {
+      if (exitSettled) return;
+      exitSettled = true;
+      if (error) rejectExit(error);
+      else resolveExit();
+    };
+    const rejectPending = (error: Error) => {
+      for (const { reject } of pending.values()) reject(error);
+      pending.clear();
+    };
+    const stdioGuard = installChildProcessStdioErrorHandlers(child, {
+      onUnexpectedError: ({ error, stream }) => {
+        const gatewayError = stdioProtocolError(
+          `Local stdio MCP ${stream} stream failed`,
+          {
+            connectionId: input.connection.id,
+            catalogEntryId: input.entry.id,
+            message: error.message,
+          },
+        );
+        rejectPending(gatewayError);
+        settleExit(gatewayError);
+        child.kill("SIGTERM");
+      },
+    });
+    child.on("error", (error) => {
+      const gatewayError = new ToolGatewayHttpError(502, "Local stdio MCP command failed to start", "local_stdio_spawn_failed", {
+        connectionId: input.connection.id,
+        templateId: input.template.templateId,
+        message: error.message,
+      });
+      rejectPending(gatewayError);
+      settleExit(gatewayError);
+    });
+    child.on("exit", (code, signal) => {
+      if (pending.size > 0) {
+        rejectPending(new ToolGatewayHttpError(502, "Local stdio MCP command exited before responding", "local_stdio_process_exited", {
           connectionId: input.connection.id,
           catalogEntryId: input.entry.id,
+          code,
+          signal,
+          stderr,
         }));
       }
-      pending.clear();
+      settleExit();
+    });
+    child.on("close", () => stdioGuard.dispose());
+    const timer = setTimeout(() => {
+      child.kill("SIGTERM");
+      rejectPending(new ToolGatewayHttpError(504, "Local stdio MCP tool call timed out", "tool_timeout", {
+        connectionId: input.connection.id,
+        catalogEntryId: input.entry.id,
+      }));
     }, input.timeoutMs);
     timer.unref?.();
     child.stdout.setEncoding("utf8");
@@ -2650,13 +2702,10 @@ export function createToolGatewayService(
               }
             }
           } catch {
-            for (const { reject } of pending.values()) {
-              reject(stdioProtocolError("Local stdio MCP server returned invalid JSON", {
-                connectionId: input.connection.id,
-                catalogEntryId: input.entry.id,
-              }));
-            }
-            pending.clear();
+            rejectPending(stdioProtocolError("Local stdio MCP server returned invalid JSON", {
+              connectionId: input.connection.id,
+              catalogEntryId: input.entry.id,
+            }));
           }
         }
         newline = stdout.indexOf("\n");
@@ -2665,44 +2714,24 @@ export function createToolGatewayService(
     child.stderr.on("data", (chunk: string) => {
       stderr = `${stderr}${chunk}`.slice(-4_000);
     });
-    const exitPromise = new Promise<void>((resolve, reject) => {
-      child.on("error", (error) => {
-        const gatewayError = new ToolGatewayHttpError(502, "Local stdio MCP command failed to start", "local_stdio_spawn_failed", {
-          connectionId: input.connection.id,
-          templateId: input.template.templateId,
-          message: error.message,
-        });
-        for (const { reject: rejectPending } of pending.values()) {
-          rejectPending(gatewayError);
-        }
-        pending.clear();
-        reject(gatewayError);
-      });
-      child.on("exit", (code, signal) => {
-        if (pending.size === 0) {
-          resolve();
-          return;
-        }
-        for (const { reject: rejectPending } of pending.values()) {
-          rejectPending(new ToolGatewayHttpError(502, "Local stdio MCP command exited before responding", "local_stdio_process_exited", {
-            connectionId: input.connection.id,
-            catalogEntryId: input.entry.id,
-            code,
-            signal,
-            stderr,
-          }));
-        }
-        pending.clear();
-        resolve();
-      });
-    });
     const request = (method: string, params: Record<string, unknown>) => {
       const id = nextId;
       nextId += 1;
       const promise = new Promise<unknown>((resolve, reject) => {
         pending.set(id, { resolve, reject });
       });
-      child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`);
+      if (child.stdin.destroyed || !child.stdin.writable) {
+        const waiter = pending.get(id);
+        pending.delete(id);
+        waiter?.reject(stdioProtocolError("Local stdio MCP stdin is not writable", {
+          connectionId: input.connection.id,
+          catalogEntryId: input.entry.id,
+        }));
+        return promise;
+      }
+      child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`, (error) => {
+        if (error) stdioGuard.handleError("stdin", error);
+      });
       return promise;
     };
     try {
@@ -2711,14 +2740,18 @@ export function createToolGatewayService(
         capabilities: {},
         clientInfo: { name: "paperclip-tool-gateway", version: "0.3.1" },
       });
-      child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized", params: {} })}\n`);
+      if (!child.stdin.destroyed && child.stdin.writable) {
+        child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized", params: {} })}\n`, (error) => {
+          if (error) stdioGuard.handleError("stdin", error);
+        });
+      }
       return await request("tools/call", {
         name: input.entry.toolName,
         arguments: input.parameters ?? {},
       });
     } finally {
       clearTimeout(timer);
-      child.stdin.end();
+      if (!child.stdin.destroyed && child.stdin.writable) child.stdin.end();
       child.kill("SIGTERM");
       await exitPromise.catch(() => undefined);
     }

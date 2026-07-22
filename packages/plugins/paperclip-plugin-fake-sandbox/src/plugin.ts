@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 import { definePlugin } from "@paperclipai/plugin-sdk";
 import type {
   PluginEnvironmentAcquireLeaseParams,
@@ -70,6 +70,42 @@ const templates = new Map<string, FakeTemplateState>();
 const DEFAULT_FAKE_SANDBOX_PATH = "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
 const FAKE_SANDBOX_SIGKILL_GRACE_MS = 250;
 const REDACTED_FAKE_SSH_COMMAND = "ssh sandbox@[fake-setup-host-redacted] -p [fake-port-redacted]";
+
+type ChildProcessStdioStream = "stdin" | "stdout" | "stderr";
+
+function installChildProcessStdioErrorHandlers(
+  child: ChildProcess,
+  onUnexpectedError: (stream: ChildProcessStdioStream, error: Error) => void,
+) {
+  const handleError = (stream: ChildProcessStdioStream, error: Error) => {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "EPIPE" || code === "ECONNRESET") return;
+    try {
+      onUnexpectedError(stream, error);
+    } catch (handlerError) {
+      console.error("Child process stdio error handler failed", handlerError);
+    }
+  };
+  const listeners: Array<{
+    stream: NonNullable<ChildProcess[ChildProcessStdioStream]>;
+    listener: (error: Error) => void;
+  }> = [];
+
+  for (const streamName of ["stdin", "stdout", "stderr"] as const) {
+    const stream = child[streamName];
+    if (!stream) continue;
+    const listener = (error: Error) => handleError(streamName, error);
+    stream.on("error", listener);
+    listeners.push({ stream, listener });
+  }
+
+  return {
+    handleError,
+    dispose: () => {
+      for (const { stream, listener } of listeners) stream.off("error", listener);
+    },
+  };
+}
 
 function parseConfig(raw: Record<string, unknown>): FakeDriverConfig {
   return {
@@ -211,8 +247,18 @@ async function runCommand(params: PluginEnvironmentExecuteParams, timeoutMs: num
     });
     let stdout = "";
     let stderr = "";
+    let settled = false;
     let timedOut = false;
     let killTimer: NodeJS.Timeout | null = null;
+    const rejectOnce = (error: Error) => {
+      if (settled) return;
+      settled = true;
+      reject(error);
+    };
+    const stdioGuard = installChildProcessStdioErrorHandlers(child, (stream, error) => {
+      rejectOnce(new Error(`Sandbox command ${stream} stream failed: ${error.message}`));
+      child.kill("SIGTERM");
+    });
     const timer = timeoutMs > 0
       ? setTimeout(() => {
           timedOut = true;
@@ -232,11 +278,14 @@ async function runCommand(params: PluginEnvironmentExecuteParams, timeoutMs: num
     child.on("error", (error) => {
       if (timer) clearTimeout(timer);
       if (killTimer) clearTimeout(killTimer);
-      reject(error);
+      rejectOnce(error);
     });
     child.on("close", (code, signal) => {
       if (timer) clearTimeout(timer);
       if (killTimer) clearTimeout(killTimer);
+      stdioGuard.dispose();
+      if (settled) return;
+      settled = true;
       resolve({
         exitCode: timedOut ? null : code,
         signal,
@@ -251,8 +300,16 @@ async function runCommand(params: PluginEnvironmentExecuteParams, timeoutMs: num
     });
 
     if (params.stdin != null && child.stdin) {
-      child.stdin.write(params.stdin);
-      child.stdin.end();
+      const stdin = child.stdin;
+      if (!stdin.destroyed && stdin.writable) {
+        stdin.write(params.stdin, (error) => {
+          if (error) {
+            stdioGuard.handleError("stdin", error);
+            return;
+          }
+          if (!settled && !stdin.destroyed && stdin.writable) stdin.end();
+        });
+      }
     }
   });
 }

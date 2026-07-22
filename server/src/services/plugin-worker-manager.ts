@@ -22,6 +22,10 @@ import { fork, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { createInterface, type Interface as ReadlineInterface } from "node:readline";
+import {
+  installChildProcessStdioErrorHandlers,
+  type ChildProcessStdioGuard,
+} from "@paperclipai/adapter-utils/child-process-stdio";
 import type { PaperclipPluginManifestV1 } from "@paperclipai/shared";
 import {
   JSONRPC_VERSION,
@@ -384,6 +388,7 @@ export function createPluginWorkerHandle(
   let childProcess: ChildProcess | null = null;
   let readline: ReadlineInterface | null = null;
   let stderrReadline: ReadlineInterface | null = null;
+  let childStdioGuard: ChildProcessStdioGuard | null = null;
   let status: WorkerStatus = "stopped";
   let startedAt: number | null = null;
   let stderrExcerpt = "";
@@ -430,11 +435,16 @@ export function createPluginWorkerHandle(
   // -----------------------------------------------------------------------
 
   function sendMessage(message: unknown): void {
-    if (!childProcess?.stdin?.writable) {
+    const child = childProcess;
+    const stdin = child?.stdin;
+    const stdioGuard = childStdioGuard;
+    if (!stdin?.writable || stdin.destroyed || !stdioGuard) {
       throw new Error(`Worker process for plugin "${pluginId}" is not writable`);
     }
     const serialized = serializeMessage(message as any);
-    childProcess.stdin.write(serialized);
+    stdin.write(serialized, (error) => {
+      if (error) stdioGuard.handleError("stdin", error);
+    });
   }
 
   function errorCodeForWorkerHostError(err: unknown): number {
@@ -739,6 +749,22 @@ export function createPluginWorkerHandle(
   }
 
   function attachStdioHandlers(child: ChildProcess): void {
+    const stdioGuard = installChildProcessStdioErrorHandlers(child, {
+      onUnexpectedError: ({ error, stream }) => {
+        rejectAllPending(new Error(formatWorkerFailureMessage(
+          `Worker ${stream} stream failed: ${error.message}`,
+          stderrExcerpt,
+        )));
+        child.kill("SIGTERM");
+        log.error({ err: error.message, stream }, "worker stdio stream error");
+      },
+    });
+    childStdioGuard = stdioGuard;
+    child.once("close", () => {
+      stdioGuard.dispose();
+      if (childStdioGuard === stdioGuard) childStdioGuard = null;
+    });
+
     // Read NDJSON from stdout
     if (child.stdout) {
       readline = createInterface({ input: child.stdout });

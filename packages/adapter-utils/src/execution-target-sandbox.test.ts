@@ -333,6 +333,51 @@ describe("sandbox adapter execution targets", () => {
     }
   });
 
+  it("keeps the process session bridge alive when the remote child closes stdin early", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-process-session-epipe-"));
+    cleanupDirs.push(rootDir);
+    const childPath = path.join(rootDir, "closed-stdin-acp-child.mjs");
+    await writeFile(
+      childPath,
+      [
+        "import fs from 'node:fs';",
+        "fs.closeSync(0);",
+        "setTimeout(() => process.exit(0), 150);",
+      ].join("\n"),
+      "utf8",
+    );
+    const target: AdapterSandboxExecutionTarget = {
+      kind: "remote",
+      transport: "sandbox",
+      providerKey: "local-test",
+      remoteCwd: rootDir,
+      timeoutMs: 30_000,
+      runner: createLocalSandboxRunner(),
+    };
+
+    const bridge = await startAdapterExecutionTargetProcessSessionBridge({
+      runId: "run-process-session-epipe",
+      target,
+      runtimeRootDir: path.posix.join(rootDir, ".paperclip-runtime", "acpx"),
+      adapterKey: "acpx",
+      command: process.execPath,
+      args: [childPath],
+      cwd: rootDir,
+      env: {},
+      timeoutSec: 5,
+      onLog: async () => {},
+    });
+    expect(bridge).not.toBeNull();
+
+    try {
+      const result = await runProxyWithInput(bridge!.agentCommand, "late input\n");
+      expect(result.code).toBe(0);
+      expect(result.stderr).toBe("");
+    } finally {
+      await bridge?.stop();
+    }
+  });
+
   it("ignores unauthenticated connections to the process session bridge", async () => {
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-process-session-auth-"));
     cleanupDirs.push(rootDir);

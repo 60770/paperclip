@@ -24,10 +24,16 @@ function createChildThatErrorsOnMicrotask(err: Error): ChildProcess {
   const stream = Object.assign(new EventEmitter(), {
     setEncoding: () => {},
   });
+  const stdin = Object.assign(new EventEmitter(), {
+    destroyed: false,
+    writable: true,
+    write: vi.fn(),
+    end: vi.fn(),
+  });
   Object.assign(child, {
     stdout: stream,
     stderr: Object.assign(new EventEmitter(), { setEncoding: () => {} }),
-    stdin: { write: vi.fn(), end: vi.fn() },
+    stdin,
     kill: vi.fn(),
   });
   queueMicrotask(() => {

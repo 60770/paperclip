@@ -86,7 +86,12 @@ describe("board-chat client disconnect", () => {
     const proc = new EventEmitter() as any;
     proc.stdout = new EventEmitter();
     proc.stderr = new EventEmitter();
-    proc.stdin = { write: vi.fn(), end: vi.fn() };
+    proc.stdin = Object.assign(new EventEmitter(), {
+      destroyed: false,
+      writable: true,
+      write: vi.fn((_data, callback) => callback?.()),
+      end: vi.fn(),
+    });
     proc.exitCode = null;
     proc.killed = false;
     proc.kill = vi.fn(() => {

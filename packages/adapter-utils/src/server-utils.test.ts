@@ -442,6 +442,109 @@ describe("runChildProcess", () => {
     expect(finishedAt - startedAt).toBeGreaterThanOrEqual(spawnDelayMs);
   });
 
+  it("absorbs stdin EPIPE when the child closes its peer before the deferred write", async () => {
+    const runId = randomUUID();
+    const diagnostics: string[] = [];
+    let settlements = 0;
+
+    const result = await runChildProcess(
+      runId,
+      process.execPath,
+      [
+        "-e",
+        "require('node:fs').closeSync(0); setTimeout(() => process.exit(0), 150);",
+      ],
+      {
+        cwd: process.cwd(),
+        env: {},
+        stdin: "deferred input",
+        timeoutSec: 5,
+        graceSec: 1,
+        onLog: async () => {},
+        onLogError: (_error, _runId, message) => diagnostics.push(message),
+        onSpawn: async () => {
+          const stdin = runningProcesses.get(runId)?.child.stdin;
+          expect(stdin).toBeTruthy();
+          stdin!.emit("error", Object.assign(new Error("write EPIPE"), { code: "EPIPE" }));
+          await new Promise((resolve) => setTimeout(resolve, 50));
+        },
+      },
+    ).finally(() => {
+      settlements += 1;
+    });
+
+    expect(result.exitCode).toBe(0);
+    expect(diagnostics).toEqual([]);
+    expect(settlements).toBe(1);
+    expect(runningProcesses.has(runId)).toBe(false);
+  });
+
+  it("absorbs expected ECONNRESET errors from piped child streams", async () => {
+    const runId = randomUUID();
+    const diagnostics: string[] = [];
+
+    const result = await runChildProcess(
+      runId,
+      process.execPath,
+      ["-e", "setTimeout(() => process.exit(0), 50);"],
+      {
+        cwd: process.cwd(),
+        env: {},
+        timeoutSec: 5,
+        graceSec: 1,
+        onLog: async () => {},
+        onLogError: (_error, _runId, message) => diagnostics.push(message),
+        onSpawn: async () => {
+          const stdout = runningProcesses.get(runId)?.child.stdout;
+          expect(stdout).toBeTruthy();
+          stdout!.emit(
+            "error",
+            Object.assign(new Error("read ECONNRESET"), { code: "ECONNRESET" }),
+          );
+        },
+      },
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(diagnostics).toEqual([]);
+    expect(runningProcesses.has(runId)).toBe(false);
+  });
+
+  it("logs and fails once on an unexpected child stream error", async () => {
+    const runId = randomUUID();
+    const diagnostics: Array<{ error: unknown; message: string }> = [];
+    let childPid = 0;
+
+    const resultPromise = runChildProcess(
+      runId,
+      process.execPath,
+      ["-e", "setInterval(() => {}, 1000);"],
+      {
+        cwd: process.cwd(),
+        env: {},
+        timeoutSec: 5,
+        graceSec: 1,
+        onLog: async () => {},
+        onLogError: (error, _runId, message) => diagnostics.push({ error, message }),
+        onSpawn: async ({ pid }) => {
+          childPid = pid;
+          const stderr = runningProcesses.get(runId)?.child.stderr;
+          expect(stderr).toBeTruthy();
+          stderr!.emit("error", Object.assign(new Error("unexpected stream fault"), { code: "EIO" }));
+        },
+      },
+    );
+
+    await expect(resultPromise).rejects.toThrow(
+      'Child process stderr stream failed for command',
+    );
+    expect(diagnostics).toHaveLength(1);
+    expect(diagnostics[0]?.message).toBe("child process stderr stream failed");
+    expect(diagnostics[0]?.error).toMatchObject({ code: "EIO" });
+    expect(runningProcesses.has(runId)).toBe(false);
+    expect(await waitForPidExit(childPid, 2_000)).toBe(true);
+  });
+
   it.skipIf(process.platform === "win32")("kills descendant processes on timeout via the process group", async () => {
     let descendantPid: number | null = null;
 
