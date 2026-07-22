@@ -15,6 +15,7 @@ const DEFAULT_BRIDGE_MAX_QUEUE_DEPTH = 64;
 const DEFAULT_BRIDGE_MAX_BODY_BYTES = 256 * 1024;
 const DEFAULT_BRIDGE_MAX_ATTACHMENT_BODY_BYTES = 12 * 1024 * 1024;
 const REMOTE_WRITE_BASE64_CHUNK_SIZE = 32 * 1024;
+const DECODE_BASE64_VALIDATION_CHUNK_BYTES = 3 * 1024;
 const SANDBOX_CALLBACK_BRIDGE_ENTRYPOINT = "paperclip-bridge-server.mjs";
 const SANDBOX_EXEC_CHANNEL_ENV = "PAPERCLIP_SANDBOX_EXEC_CHANNEL";
 const SANDBOX_EXEC_CHANNEL_BRIDGE = "bridge";
@@ -328,17 +329,28 @@ export function decodeSandboxCallbackBridgeRequestBody(
   if (encoding !== "base64") {
     throw new Error(`Unsupported bridge request body encoding: ${String(encoding)}`);
   }
-  if (
-    request.body.length % 4 !== 0 ||
-    !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(request.body)
-  ) {
+  if (request.body.length % 4 !== 0) {
     throw new Error("Invalid base64 bridge request body.");
   }
   const decoded = Buffer.from(request.body, "base64");
-  if (decoded.toString("base64") !== request.body) {
+  if (!isBufferBase64Canonical(request.body, decoded)) {
     throw new Error("Invalid base64 bridge request body.");
   }
   return decoded;
+}
+
+function isBufferBase64Canonical(body: string, decoded: Buffer): boolean {
+  if (body.length === 0) return decoded.length === 0;
+  if (decoded.length === 0) return body.length === 0;
+  let bodyOffset = 0;
+  for (let offset = 0; offset < decoded.length; offset += DECODE_BASE64_VALIDATION_CHUNK_BYTES) {
+    const chunkLength = Math.min(DECODE_BASE64_VALIDATION_CHUNK_BYTES, decoded.length - offset);
+    const encodedChunk = decoded.subarray(offset, offset + chunkLength).toString("base64");
+    const chunkBody = body.slice(bodyOffset, bodyOffset + encodedChunk.length);
+    if (chunkBody !== encodedChunk) return false;
+    bodyOffset += encodedChunk.length;
+  }
+  return bodyOffset === body.length;
 }
 
 export function sandboxCallbackBridgeDirectories(rootDir: string): SandboxCallbackBridgeDirectories {
