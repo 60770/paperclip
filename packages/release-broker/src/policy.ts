@@ -106,6 +106,7 @@ function hasSecurityFinding(lines: string[]): boolean {
   return lines.some((line) => {
     const withoutList = line
       .replace(/^\s*(?:(?:[-*+]|\d+[.)])\s+)?/, "")
+      .replace(/^#{1,6}(?:\s+|$)/, "")
       .replace(/[*_]/g, "");
     return /^(?:BLOCKER|HIGH)(?:\s*(?::|[-–—])|\s+|$)/i.test(withoutList);
   });
