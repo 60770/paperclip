@@ -148,6 +148,12 @@ describe("ReleasePolicy", () => {
     "- [x] 2) #### __MEDIUM__: authorization bypass remains",
     "~~CRITICAL~~: authorization bypass remains",
     "[admonition] HIGH: authorization bypass remains",
+    "### [HIGH]: authorization bypass remains",
+    "[MEDIUM](https://example.invalid): authorization bypass remains",
+    "![CRITICAL](badge): authorization bypass remains",
+    "### <HIGH>: authorization bypass remains",
+    "> HIGH: authorization bypass remains",
+    "```text\nCRITICAL: authorization bypass remains\n```",
   ])("rejects Markdown-equivalent security findings: %s", async (finding) => {
     paperclip.comments.get(ISSUE)![1]!.body =
       `APPROVED-REVIEW\n\n${finding}\nAPPROVED-QA-WAIVED: Backend-only broker\n\ncc [@ReleaseBot](agent://${RELEASE_BOT})`;

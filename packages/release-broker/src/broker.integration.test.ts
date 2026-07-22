@@ -127,6 +127,12 @@ describe("release broker GitLab integration", () => {
     "### `CRITICAL`: authorization bypass remains",
     "### HIGH: authorization bypass remains",
     "- MEDIUM: authorization bypass remains",
+    "### [HIGH]: authorization bypass remains",
+    "[MEDIUM](https://example.invalid): authorization bypass remains",
+    "![CRITICAL](badge): authorization bypass remains",
+    "### <HIGH>: authorization bypass remains",
+    "> HIGH: authorization bypass remains",
+    "```text\nCRITICAL: authorization bypass remains\n```",
   ])("keeps merge PUT at zero for a Markdown security finding: %s", async (finding) => {
     const fixture = boundFixture(finding);
     await expect(fixture.broker.requestCapability(CLIENT, REQUEST))

@@ -176,15 +176,23 @@ function hasAmbiguousSecurityLabel(value: string): boolean {
   let candidate = value;
 
   for (let depth = 0; depth < MAX_SECURITY_MARKDOWN_DEPTH; depth += 1) {
+    const wrapper = /^(?:<([^>\n]{1,64})>|\[([^\]\n]{0,32})\])/.exec(candidate);
+    const wrappedLabel = wrapper?.[1] ?? wrapper?.[2];
+    if (wrappedLabel && hasSecurityLabelCandidate(wrappedLabel.trimStart())) return true;
+
     const prefix = AMBIGUOUS_SECURITY_PREFIX.exec(candidate);
     if (!prefix) break;
     candidate = candidate.slice(prefix[0].length);
   }
 
   if (AMBIGUOUS_SECURITY_PREFIX.test(candidate)) return true;
-  const severity = SECURITY_SEVERITY.exec(candidate);
+  return hasSecurityLabelCandidate(candidate);
+}
+
+function hasSecurityLabelCandidate(value: string): boolean {
+  const severity = SECURITY_SEVERITY.exec(value);
   if (!severity) return false;
-  const suffix = candidate.slice(severity[0].length);
+  const suffix = value.slice(severity[0].length);
   if (SECURITY_FINDING_SEPARATOR.test(suffix)) return true;
   return !/^[A-Za-z0-9-]/.test(suffix);
 }
@@ -299,8 +307,8 @@ export class ReleasePolicy {
       const tokenKey = keyOf(comment);
       const target = markers.filter((marker) => compareKeys(keyOf(marker.comment), tokenKey) <= 0).at(-1);
       if (!target || target.iid !== expectedIid || comment.authorType !== "agent") continue;
-      const lines = approvalLines(comment.body);
-      if (!lines.some((line) => line.includes(releaseBotMention))) continue;
+      const tokenLines = approvalLines(comment.body);
+      if (!tokenLines.some((line) => line.includes(releaseBotMention))) continue;
 
       const agent = await this.#paperclip.getAgent(comment.authorAgentId!);
       const isReviewer = agent.role === "engineer" && agent.urlKey.startsWith("reviewer");
@@ -309,13 +317,13 @@ export class ReleasePolicy {
       if (
         isReviewer &&
         comment.authorAgentId !== candidate.authorAgentId &&
-        lines.some((line) => REVIEW_TOKEN.test(line)) &&
-        !hasSecurityFinding(lines)
+        tokenLines.some((line) => REVIEW_TOKEN.test(line)) &&
+        !hasSecurityFinding(comment.body.split(/\r?\n/))
       ) {
         review = true;
       }
-      if (isTester && lines.some((line) => QA_TOKEN.test(line))) qa = true;
-      const waiver = lines.map((line) => WAIVER_TOKEN.exec(line)).find((match) => match !== null);
+      if (isTester && tokenLines.some((line) => QA_TOKEN.test(line))) qa = true;
+      const waiver = tokenLines.map((line) => WAIVER_TOKEN.exec(line)).find((match) => match !== null);
       if (waiverAllowed && isReviewer && waiver && waiver[1]!.trim().length >= 5) qa = true;
     }
 
