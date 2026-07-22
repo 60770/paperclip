@@ -19,7 +19,6 @@
     "test": "vitest run --config vitest.config.ts"
   },
   "dependencies": {
-    "@paperclipai/adapter-utils": "workspace:*",
     "@paperclipai/plugin-sdk": "workspace:*"
   },
   "devDependencies": {
