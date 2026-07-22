@@ -24,8 +24,8 @@ for runtime_only_path in \
     || fail "Canonical source must not contain runtime-only path: ${runtime_only_path}"
 done
 
-warden_bin="${WARDEN_BIN:-/opt/warden/bin/warden}"
-[[ -x "${warden_bin}" ]] || fail "Warden executable is unavailable: ${warden_bin}"
+docker_bin="${DOCKER_BIN:-docker}"
+command -v "${docker_bin}" >/dev/null 2>&1 || fail "Docker Compose is required to render config."
 temp_root="$(mktemp -d "${PAPERCLIP_RUN_SCRATCH_DIR:-${TMPDIR:-/tmp}}/tester1-attestation.XXXXXX")"
 cleanup() {
   rm -rf -- "${temp_root}"
@@ -40,7 +40,13 @@ sentinel_sha256="$(printf '0%.0s' {1..64})"
   cd -- "${temp_root}/source"
   WARDEN_SOURCE_MANIFEST_SHA256="${sentinel_sha256}" \
   WARDEN_RENDERED_CONFIG_SHA256="${sentinel_sha256}" \
-    "${warden_bin}" env config
+    "${docker_bin}" compose \
+      --project-directory "${temp_root}/source" \
+      --env-file "${temp_root}/source/.env" \
+      -p paperclip-tester1 \
+      -f "${temp_root}/source/.warden/warden-networks.yml" \
+      -f "${temp_root}/source/.warden/warden-env.yml" \
+      config
 ) >"${temp_root}/rendered.yml"
 sed "s|${temp_root}/source|<WARDEN_ROOT>|g" \
   "${temp_root}/rendered.yml" >"${temp_root}/rendered-normalized.yml"

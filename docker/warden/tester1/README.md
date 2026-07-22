@@ -5,17 +5,19 @@ Dedicated Warden stack for the Paperclip `Tester1` agent.
 ## Auditability and rebuild attestation
 
 This directory is the Git-tracked source of truth. The operational copy under
-the company `shared/warden/tester1` tree contains only the same attested files
-plus `.env` and runtime SSH material. Private keys and environment-local files
-must never be committed here.
+the company `shared/warden/tester1` tree supplies only `.env` and runtime SSH
+material to rebuilds. Private keys and environment-local files must never be
+committed here. Tracked files in the live tree remain useful for non-build
+operations, but they are never a build context.
 
 Every operational command starts with `verify-attestation.sh`, which requires:
 
 - a clean Git worktree and a Git-tracked `attestation/source-manifest.sha256`;
 - exact source digests and file modes in the canonical and live trees;
-- no unexpected or symlinked files in the live build contexts;
+- no unexpected or symlinked files in live non-build operations;
 - an exact hash of the Warden-rendered configuration;
-- after rebuild, matching source/config labels on all four running images.
+- after rebuild, matching source/config labels and builder-recorded image IDs
+  on all four running images.
 
 Refresh the manifest only after reviewing a canonical source change:
 
@@ -24,16 +26,55 @@ Refresh the manifest only after reviewing a canonical source change:
 git diff -- attestation/
 ```
 
-After that change is committed, synchronize and rebuild from the same checkout:
+The privileged builder must be installed from the exact reviewed commit. Its
+fixed installation directory and every parent are root-owned and not writable
+by agents. The builder verifies its own bytes against the selected Git object
+before materializing anything:
 
 ```bash
-./sync-live-source.sh --live-dir /absolute/path/to/shared/warden/tester1
-./rebuild-attested.sh --live-dir /absolute/path/to/shared/warden/tester1
+commit=<full-reviewed-commit-sha>
+sudo install -d -o root -g root -m 0755 /usr/local/libexec/paperclip-tester1
+git show "${commit}:docker/warden/tester1/rebuild-attested.sh" \
+  | sudo tee /usr/local/libexec/paperclip-tester1/rebuild-attested.sh >/dev/null
+git show "${commit}:docker/warden/tester1/materialize-attested-snapshot.py" \
+  | sudo tee /usr/local/libexec/paperclip-tester1/materialize-attested-snapshot.py >/dev/null
+sudo chown root:root /usr/local/libexec/paperclip-tester1/*
+sudo chmod 0755 /usr/local/libexec/paperclip-tester1/rebuild-attested.sh \
+  /usr/local/libexec/paperclip-tester1/materialize-attested-snapshot.py
 ```
 
-`sync-live-source.sh` never deletes unexpected live files. The subsequent gate
-fails closed so an operator must inspect such drift. Use `run-attested.sh` for
-non-rebuild operations and boundary verification:
+Before the first privileged rebuild, make the four runtime inputs non-writable
+outside their owner. The builder rejects other modes, symlinks, hard links,
+owner drift, or any fingerprint change while copying:
+
+```bash
+chmod 0600 /absolute/path/to/shared/warden/tester1/.env \
+  /absolute/path/to/shared/warden/tester1/.warden/runner/ssh_host_ed25519_key
+chmod 0644 /absolute/path/to/shared/warden/tester1/.warden/runner/authorized_keys \
+  /absolute/path/to/shared/warden/tester1/.warden/runner/ssh_host_ed25519_key.pub
+```
+
+Run the installed builder with the same full commit SHA:
+
+```bash
+sudo /usr/local/libexec/paperclip-tester1/rebuild-attested.sh \
+  --repo-dir "$(git rev-parse --show-toplevel)" \
+  --commit "${commit}" \
+  --live-dir /absolute/path/to/shared/warden/tester1
+```
+
+The builder reads tracked blobs and executable modes directly from the commit,
+opens every runtime path with `O_NOFOLLOW`, checks modes and stable stat
+fingerprints, then freezes the root-owned snapshot below
+`/var/lib/paperclip/warden-builder/tester1`. It renders, builds, and starts via
+Docker Compose only from that snapshot. It does not execute the mutable Warden
+installation. Failed postchecks take the environment down; successful
+postchecks compare each running container image ID with the ID captured
+immediately after the snapshot build as well as both immutable labels.
+
+`sync-live-source.sh` never deletes unexpected live files and is retained for
+non-build operational parity. Use `run-attested.sh` for non-rebuild operations
+and boundary verification:
 
 ```bash
 ./run-attested.sh --live-dir /absolute/path/to/shared/warden/tester1 -- \
@@ -43,8 +84,11 @@ non-rebuild operations and boundary verification:
 ```
 
 `test-attestation-gate.sh` mutates a verifier and the Warden config in isolated
-fixtures, injects runtime-only SSH material into a source manifest, and proves
-each change is rejected before Warden invocation or live-file writes.
+fixtures, injects runtime-only SSH material into a source manifest, races a
+tracked live-file mutation+restore between snapshot verification and build,
+and proves the build context remains the committed snapshot. It also rejects
+unsafe runtime modes, non-builder image IDs, and drift before Compose or live
+file writes.
 `test-provision-secret-argv.sh` exercises new-environment and key-rotation
 provisioning with sentinel credentials and proves neither value enters argv.
 
@@ -220,8 +264,8 @@ To update the toolchain:
    lock with `npm install --package-lock-only --ignore-scripts --no-audit --no-fund --save-exact <packages>`.
 4. Run `./test-supply-chain-guard.sh`; it proves that mutable `FROM`, `npm
    install`, or an omitted lockfile fail closed.
-5. Refresh and commit the attestation, synchronize the live tree, then rebuild
-   with `./rebuild-attested.sh --live-dir <path>`. Run the boundary smoke and
+5. Refresh and commit the attestation, install the builder from that reviewed
+   full commit, then rebuild with the privileged command above. Run the boundary smoke and
    `run-attested.sh --live-dir <path> -- ./audit-runner-image.sh <artifact-directory>`.
 
 `audit-runner-image.sh` resolves the runner image ID once and saves that ID to a
@@ -260,20 +304,32 @@ last accepted digest, SBOM, and scan report for comparison before rebuilding.
 
 ## Operations
 
-Run Warden commands from this directory:
+Run non-build Warden commands from this directory. Rebuild only through the
+installed root-owned boundary:
 
 ```bash
-./rebuild-attested.sh --live-dir /absolute/path/to/shared/warden/tester1
+sudo /usr/local/libexec/paperclip-tester1/rebuild-attested.sh \
+  --repo-dir "$(git rev-parse --show-toplevel)" \
+  --commit <full-reviewed-commit-sha> \
+  --live-dir /absolute/path/to/shared/warden/tester1
 ./run-attested.sh --live-dir /absolute/path/to/shared/warden/tester1 -- /opt/warden/bin/warden env ps
 ./run-attested.sh --live-dir /absolute/path/to/shared/warden/tester1 -- /opt/warden/bin/warden env logs --tail=100
 ./run-attested.sh --live-dir /absolute/path/to/shared/warden/tester1 -- /opt/warden/bin/warden env down
 ```
 
-Apply this hardening with `rebuild-attested.sh`, which uses
-`warden env up --build --remove-orphans`, so the legacy daemon container is
-deleted. If the rebuilt runner fails, roll back by taking
+Apply this hardening only with the installed builder, which uses an attested
+Compose network fragment plus `build` followed by `up --no-build
+--force-recreate --remove-orphans`, so the legacy daemon container is deleted.
+If the rebuilt runner fails, roll back by taking
 the complete Warden environment down and leaving Tester1 without a default
 environment. Do not restore or restart the privileged daemon.
+
+Root and the Docker daemon remain trust anchors. Agents must not have write
+access to the installed builder or `/var/lib/paperclip/warden-builder`, and
+Docker socket/group access must be limited to the operator boundary. Successful
+snapshots are retained root-only because `qa-tunnel` bind-mounts its attested
+host key from that path and must survive daemon or host restarts. Retire old
+snapshots only after confirming no container references them.
 
 The base `env up` starts `qa-tunnel`. The fixed reverse listeners remain limited
 to runner loopback ports 8223/8224; TaIA's Tester1 preview uses host and remote
@@ -284,7 +340,10 @@ port 8223 so the same URL is reachable from the control plane and the browser.
 Rebuild the scoped Warden image, then run the deterministic smoke:
 
 ```bash
-./rebuild-attested.sh --live-dir /absolute/path/to/shared/warden/tester1
+sudo /usr/local/libexec/paperclip-tester1/rebuild-attested.sh \
+  --repo-dir "$(git rev-parse --show-toplevel)" \
+  --commit <full-reviewed-commit-sha> \
+  --live-dir /absolute/path/to/shared/warden/tester1
 ./run-attested.sh --live-dir /absolute/path/to/shared/warden/tester1 -- ./verify-no-docker-boundary.sh
 RUNNER_SSH_KEY_FILE=/dev/shm/tester1-runner/runner_ed25519 \
 ./run-attested.sh --live-dir /absolute/path/to/shared/warden/tester1 -- ./verify-playwright-boundary.sh
