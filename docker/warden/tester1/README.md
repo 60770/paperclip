@@ -225,10 +225,35 @@ To update the toolchain:
    with `./rebuild-attested.sh --live-dir <path>`. Run the boundary smoke and
    `run-attested.sh --live-dir <path> -- ./audit-runner-image.sh <artifact-directory>`.
 
-`audit-runner-image.sh` uses digest-pinned Syft and Trivy images, writes a
-CycloneDX SBOM, a full vulnerability report, the final local image ID, and a
-summary. It fails when the result contains a fixable CRITICAL vulnerability;
-unfixed findings remain explicit in the report for risk review.
+`audit-runner-image.sh` resolves the runner image ID once and saves that ID to a
+temporary Docker archive. Digest-pinned Syft and Trivy containers scan only the
+same read-only archive: both run as UID/GID 65532 with networking disabled, a
+read-only root filesystem, all capabilities dropped, and
+`no-new-privileges`. Trivy's vulnerability DB is downloaded first by a separate
+mount-free bootstrap container, then streamed into the network-disabled scan
+container. No scanner receives the Docker socket.
+
+The audit writes a CycloneDX SBOM, a full vulnerability report, the final local
+image ID, the archive SHA-256, and a summary. It fails when the result contains
+a fixable CRITICAL vulnerability; unfixed findings remain explicit in the
+report for risk review. `test-supply-chain-guard.sh` includes a socket-reference
+mutation and a fake-Docker execution regression that proves both scanners use
+the archive-only boundary.
+
+The canonical live-config command runs through the attestation wrapper so the
+required source/config build labels are explicit and preserves Warden's final
+newline:
+
+```bash
+./run-attested.sh --live-dir /absolute/path/to/shared/warden/tester1 -- \
+  /bin/bash -c '/opt/warden/bin/warden env config | sha256sum'
+```
+
+Record the full digest from that raw stream in the audit handoff. Removing its
+final LF produces a different digest and must not be reported as the live-config
+hash. `attestation/rendered-config.sha256` is a separate, portable attestation
+input: it replaces the live root path and both build-label digests with
+deterministic sentinels before hashing.
 
 Rollback: run `/opt/warden/bin/warden env down` and keep Tester1 without a
 default environment. Do not restore the removed privileged daemon. Retain the

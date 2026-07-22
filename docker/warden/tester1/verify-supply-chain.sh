@@ -7,6 +7,7 @@ readonly DOCKERFILE="${ROOT_DIR}/.warden/runner/Dockerfile"
 readonly PACKAGE_JSON="${ROOT_DIR}/.warden/runner/package.json"
 readonly PACKAGE_LOCK="${ROOT_DIR}/.warden/runner/package-lock.json"
 readonly DEBIAN_SOURCES="${ROOT_DIR}/.warden/runner/debian.sources"
+readonly AUDIT_SCRIPT="${ROOT_DIR}/audit-runner-image.sh"
 
 fail() {
   printf 'ERROR: %s\n' "$*" >&2
@@ -17,6 +18,17 @@ fail() {
 [[ -r "${PACKAGE_JSON}" ]] || fail "Missing runner package.json."
 [[ -r "${PACKAGE_LOCK}" ]] || fail "Missing runner package-lock.json."
 [[ -r "${DEBIAN_SOURCES}" ]] || fail "Missing pinned Debian sources."
+[[ -r "${AUDIT_SCRIPT}" ]] || fail "Missing runner image audit script."
+
+if grep -Fq 'docker.sock' "${AUDIT_SCRIPT}"; then
+  fail "Runner image audit must not reference the Docker socket."
+fi
+grep -Fq 'docker image save --output "${archive_path}" "${image_id}"' "${AUDIT_SCRIPT}" \
+  || fail "Runner image audit must save the resolved image ID."
+grep -Fq '"docker-archive:/scan/runner-image.tar"' "${AUDIT_SCRIPT}" \
+  || fail "Syft must scan the saved Docker archive."
+grep -Fq -- '--input /scan/runner-image.tar' "${AUDIT_SCRIPT}" \
+  || fail "Trivy must scan the saved Docker archive."
 
 from_line="$(awk 'toupper($1) == "FROM" { print; exit }' "${DOCKERFILE}")"
 [[ "${from_line}" =~ ^FROM[[:space:]]+node:24-bookworm-slim@sha256:[0-9a-f]{64}$ ]] \
