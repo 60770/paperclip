@@ -14,6 +14,7 @@ export class CapabilityStore {
   readonly #ttlMs: number;
   readonly #records = new Map<string, CapabilityRecord>();
   readonly #requestIds = new Map<string, number>();
+  readonly #mergeTuples = new Map<string, number>();
 
   constructor(clock: Clock, ttlMs: number) {
     if (!Number.isSafeInteger(ttlMs) || ttlMs < 1_000 || ttlMs > 30_000) {
@@ -29,7 +30,8 @@ export class CapabilityStore {
   } {
     const now = this.#clock.now();
     this.#sweep(now);
-    if (this.#requestIds.has(claims.requestId)) {
+    const mergeTuple = capabilityMergeTuple(claims);
+    if (this.#requestIds.has(claims.requestId) || this.#mergeTuples.has(mergeTuple)) {
       throw new BrokerError("request_replayed", 409);
     }
 
@@ -45,6 +47,7 @@ export class CapabilityStore {
 
     this.#records.set(key, { claims: completeClaims, digest });
     this.#requestIds.set(claims.requestId, now + REQUEST_RETENTION_MS);
+    this.#mergeTuples.set(mergeTuple, now + REQUEST_RETENTION_MS);
     return { capability: token, claims: completeClaims };
   }
 
@@ -75,7 +78,22 @@ export class CapabilityStore {
     for (const [requestId, expiresAt] of this.#requestIds) {
       if (expiresAt <= now) this.#requestIds.delete(requestId);
     }
+    for (const [mergeTuple, expiresAt] of this.#mergeTuples) {
+      if (expiresAt <= now) this.#mergeTuples.delete(mergeTuple);
+    }
   }
 }
 
 export const systemClock: Clock = { now: () => Date.now() };
+
+function capabilityMergeTuple(
+  claims: Pick<CapabilityClaims, "companyId" | "gitlabProjectId" | "issueId" | "mrIid" | "expectedHeadSha">,
+): string {
+  return [
+    claims.companyId,
+    claims.gitlabProjectId,
+    claims.issueId,
+    claims.mrIid,
+    claims.expectedHeadSha,
+  ].join(":");
+}

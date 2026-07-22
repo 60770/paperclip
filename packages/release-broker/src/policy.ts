@@ -18,7 +18,8 @@ const REVIEW_TOKEN = /^APPROVED-REVIEW$/m;
 const QA_TOKEN = /^APPROVED-QA$/m;
 const WAIVER_TOKEN = /^APPROVED-QA-WAIVED: (\S(?:.*\S)?)$/m;
 const SECURITY_FINDING = /^(?:\s*[-*]\s*)?(?:BLOCKER|HIGH)(?:\s|:)/im;
-const JIRA_KEY = /\b([A-Z][A-Z0-9]+-\d+)\b/;
+const FEATURE_JIRA_KEY = /^feature\/(TAIA-\d+)(?:-|$)/;
+const TITLE_JIRA_KEY = /\b(TAIA-\d+)\b/;
 const MAIN_LOCK = "[MAIN_LOCKED]:";
 const MAIN_UNLOCK = "[MAIN_UNLOCKED]:";
 const HUMAN_REQUIRED = /^\[HUMAN_DECISION_REQUIRED\]:/m;
@@ -101,7 +102,7 @@ export class ReleasePolicy {
     await this.#assertFreshApprovals(issue, request.mrIid);
 
     const mr = await this.#gitlab.getMergeRequest(request.mrIid);
-    await this.#assertMergeRequest(mr, request.expectedHeadSha);
+    await this.#assertMergeRequest(mr, request.mrIid, request.expectedHeadSha);
     const jiraKey = deriveJiraKey(mr);
     await this.#assertMainLock(jiraKey);
     await this.#assertHumanGate(issue.id);
@@ -201,11 +202,14 @@ export class ReleasePolicy {
 
   async #mergeRequestJiraKey(request: CapabilityRequest): Promise<{ mr: GitLabMergeRequest; jiraKey: string }> {
     const mr = await this.#gitlab.getMergeRequest(request.mrIid);
-    await this.#assertMergeRequest(mr, request.expectedHeadSha);
+    await this.#assertMergeRequest(mr, request.mrIid, request.expectedHeadSha);
     return { mr, jiraKey: deriveJiraKey(mr) };
   }
 
-  async #assertMergeRequest(mr: GitLabMergeRequest, expectedHeadSha: string): Promise<void> {
+  async #assertMergeRequest(mr: GitLabMergeRequest, expectedIid: number, expectedHeadSha: string): Promise<void> {
+    if (mr.iid !== expectedIid) {
+      throw new BrokerError("ambiguous_response", 503);
+    }
     if (!isFullSha(mr.sha) || mr.sha !== expectedHeadSha) {
       throw new BrokerError("sha_mismatch", 409);
     }
@@ -361,6 +365,7 @@ export class ReleasePolicy {
       typeof participant.userId !== "string" ||
       state.lastDecisionOutcome !== "approved" ||
       typeof state.lastDecisionId !== "string" ||
+      completed.length !== 1 ||
       !completed.includes(stage.id)
     ) return false;
 
@@ -399,5 +404,5 @@ export class ReleasePolicy {
 }
 
 export function deriveJiraKey(mr: GitLabMergeRequest): string {
-  return JIRA_KEY.exec(mr.source_branch)?.[1] ?? JIRA_KEY.exec(mr.title)?.[1] ?? "NO-JIRA";
+  return FEATURE_JIRA_KEY.exec(mr.source_branch)?.[1] ?? TITLE_JIRA_KEY.exec(mr.title)?.[1] ?? "NO-JIRA";
 }

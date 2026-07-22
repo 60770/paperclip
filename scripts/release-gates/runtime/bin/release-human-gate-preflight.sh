@@ -143,6 +143,7 @@ is_engine_released() {
         and ($stages[0].participants[0].userId != null)
         and (.executionState.lastDecisionOutcome == "approved")
         and (.executionState.lastDecisionId != null)
+        and (($completed | length) == 1)
         and ($completed | index($stages[0].id) != null))
       then $stages[0].id
       else empty

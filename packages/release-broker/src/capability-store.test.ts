@@ -25,7 +25,11 @@ describe("CapabilityStore", () => {
       .toThrowError(expect.objectContaining({ code: "capability_expired" }));
 
     clock.value = 2_000;
-    const mismatch = store.issue({ ...baseClaims(), requestId: "22222222-2222-4222-8222-222222222222" });
+    const mismatch = store.issue({
+      ...baseClaims(),
+      mrIid: 43,
+      requestId: "22222222-2222-4222-8222-222222222222",
+    });
     expect(() => store.consume(mismatch.capability, mismatch.claims.requestId, "sha256:other"))
       .toThrowError(expect.objectContaining({ code: "capability_invalid" }));
     expect(() => store.consume(mismatch.capability, mismatch.claims.requestId, "sha256:client"))
@@ -36,6 +40,15 @@ describe("CapabilityStore", () => {
     const store = new CapabilityStore(mutableClock(), 10_000);
     store.issue(baseClaims());
     expect(() => store.issue(baseClaims())).toThrowError(BrokerError);
+  });
+
+  it("reserves one capability per company, issue, MR and head SHA", () => {
+    const store = new CapabilityStore(mutableClock(), 10_000);
+    store.issue(baseClaims());
+    expect(() => store.issue({
+      ...baseClaims(),
+      requestId: "22222222-2222-4222-8222-222222222222",
+    })).toThrowError(expect.objectContaining({ code: "request_replayed" }));
   });
 });
 

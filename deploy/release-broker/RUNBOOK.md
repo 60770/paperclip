@@ -33,6 +33,7 @@ Run bootstrap commands only from the dedicated host administrator identity.
 
 ```sh
 useradd --system --no-create-home --shell /usr/sbin/nologin gotto-merge-broker
+install -d -o root -g root -m 0755 /usr/local/libexec
 install -o root -g root -m 0444 deploy/release-broker/gotto-release-broker.service /etc/systemd/system/gotto-release-broker.service
 install -o root -g root -m 0444 deploy/release-broker/gotto-release-broker.tmpfiles /etc/tmpfiles.d/gotto-release-broker.conf
 install -o root -g root -m 0555 deploy/release-broker/install-release-broker.sh /usr/local/sbin/install-release-broker
@@ -68,7 +69,7 @@ The installer verifies before stopping the old service, then freezes merges, rec
 
 The client and pinned binding belong on the Paperclip control-plane host, not on the broker host. Do not perform this rollout while the Paperclip or agent principal retains `sudo`, Docker/LXD administration, a container socket, or any equivalent route to root. Under that condition the binding is replaceable and the rollout is invalid; leave release processing frozen.
 
-After runtime-principal isolation is independently proven, install `install-releasebot-client.sh`, `verify-release-bundle.py`, `gotto-releasebot-client.tmpfiles`, and the same public signing key as root-owned files on the control-plane host. Transfer the same signed generation below `/var/lib/gotto-releasebot-client-incoming/`, then run:
+After runtime-principal isolation is independently proven, install `install-releasebot-client.sh`, `gotto-releasebot-client.tmpfiles`, and the same public signing key as root-owned files on the control-plane host. Install `verify-release-bundle.py` at the fixed root-owned path `/usr/local/libexec/gotto-release-broker-verify`, matching the broker host. Transfer the same signed generation below `/var/lib/gotto-releasebot-client-incoming/`, then run:
 
 ```sh
 /usr/local/sbin/install-releasebot-client /var/lib/gotto-releasebot-client-incoming/<bundle-directory>

@@ -87,4 +87,24 @@ make_bundle symlink
 ln -s bin/check "$scratch/symlink/bundle/payload/link"
 assert_denied symlink
 
+printf 'fixture-key\n' > "$scratch/paperclip-api-key"
+set +e
+resolver_output="$(
+  PAPERCLIP_API_URL=https://127.0.0.1:1 \
+  PAPERCLIP_API_KEY_FILE="$scratch/paperclip-api-key" \
+  "$repo_root/scripts/release-gates/runtime/bin/release-main-lock-resolver.sh" 2>&1
+)"
+resolver_status="$?"
+set -e
+[[ "$resolver_status" -eq 21 && "$resolver_output" == MAIN_LOCK_ERROR\ reason=* ]] || {
+  printf 'main-lock wrapper did not invoke the bundled resolver\n' >&2
+  exit 1
+}
+
+grep -Fq 'and (($completed | length) == 1)' \
+  "$repo_root/scripts/release-gates/runtime/bin/release-human-gate-preflight.sh" || {
+  printf 'human gate completed-stage cardinality guard missing\n' >&2
+  exit 1
+}
+
 printf 'release attestation regression: ok\n'

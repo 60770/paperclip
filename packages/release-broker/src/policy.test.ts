@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import { StaticAttestationProvider } from "./attestation.js";
-import { ReleasePolicy } from "./policy.js";
+import { deriveJiraKey, ReleasePolicy } from "./policy.js";
 import type {
   GitLabMergeRequest,
   GitLabPipeline,
@@ -75,6 +75,12 @@ describe("ReleasePolicy", () => {
       .rejects.toMatchObject({ code: "mr_not_ready" });
   });
 
+  it("fails closed when the MR endpoint returns a different iid", async () => {
+    gitlab.mr.iid = 43;
+    await expect(policy(paperclip, gitlab).authorize(REQUEST))
+      .rejects.toMatchObject({ code: "ambiguous_response" });
+  });
+
   it("enforces main lock carve-out and human decision release", async () => {
     paperclip.comments.get(LOCK_ISSUE)!.push(comment({
       issueId: LOCK_ISSUE,
@@ -103,6 +109,17 @@ describe("ReleasePolicy", () => {
     expect(gitlab.pipelineReads).toBe(2);
     expect(paperclip.commentReads.get(LOCK_ISSUE)).toBe(1);
     expect(paperclip.commentReads.get(ISSUE)).toBe(2);
+  });
+});
+
+describe("deriveJiraKey", () => {
+  it("uses only the canonical feature branch shape before falling back to the MR title", () => {
+    expect(deriveJiraKey({ ...mr(), source_branch: "feature/TAIA-99-fix", title: "TAIA-42 fallback" }))
+      .toBe("TAIA-99");
+    expect(deriveJiraKey({ ...mr(), source_branch: "bugfix/TAIA-99-fix", title: "TAIA-42 fallback" }))
+      .toBe("TAIA-42");
+    expect(deriveJiraKey({ ...mr(), source_branch: "bugfix/TAIA-99-fix", title: "No ticket" }))
+      .toBe("NO-JIRA");
   });
 });
 

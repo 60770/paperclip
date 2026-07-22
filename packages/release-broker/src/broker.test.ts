@@ -62,6 +62,38 @@ describe("ReleaseBroker", () => {
     expect(fixture.gitlab.mergeCalls).toBe(0);
   });
 
+  it.each([
+    "human_gate_blocked",
+    "main_lock_active",
+    "sha_mismatch",
+    "mr_not_ready",
+    "paperclip_not_ready",
+    "company_mismatch",
+    "attestation_failed",
+    "ambiguous_response",
+    "upstream_failed",
+  ] as const)("keeps merge PUT at zero when capability issuance denies with %s", async (code) => {
+    const fixture = createFixture({ authorizeError: new BrokerError(code, 409) });
+    await expect(fixture.broker.requestCapability(CLIENT, request())).rejects.toMatchObject({ code });
+    expect(fixture.gitlab.mergeCalls).toBe(0);
+    expect(fixture.audit.events.at(-1)).toMatchObject({
+      event: "capability_denied",
+      reason: code,
+    });
+  });
+
+  it("allows only one outstanding capability for the same merge tuple", async () => {
+    const fixture = createFixture();
+    const issued = await fixture.broker.requestCapability(CLIENT, request());
+    await expect(fixture.broker.requestCapability(CLIENT, {
+      ...request(),
+      requestId: "33333333-3333-4333-8333-333333333333",
+    })).rejects.toMatchObject({ code: "request_replayed" });
+
+    await fixture.broker.merge(CLIENT, { capability: issued.capability, requestId: request().requestId });
+    expect(fixture.gitlab.mergeCalls).toBe(1);
+  });
+
   it("keeps merge PUT at zero for expiry, identity mismatch, request replay and audit failure", async () => {
     const expired = createFixture({ ttlMs: 1_000 });
     const expiredCapability = await expired.broker.requestCapability(CLIENT, request());
@@ -96,6 +128,11 @@ describe("ReleaseBroker", () => {
       requestId: request().requestId,
     })).rejects.toMatchObject({ code: "audit_failed" });
     expect(failingAudit.gitlab.mergeCalls).toBe(0);
+
+    const failingIssueAudit = createFixture({ audit: new FailOnWriteAuditSink(1) });
+    await expect(failingIssueAudit.broker.requestCapability(CLIENT, request()))
+      .rejects.toMatchObject({ code: "audit_failed" });
+    expect(failingIssueAudit.gitlab.mergeCalls).toBe(0);
   });
 
   it("audits transport and client-allowlist denials without recording request payloads", async () => {
@@ -121,6 +158,7 @@ function request(): CapabilityRequest {
 }
 
 function createFixture(options: {
+  authorizeError?: BrokerError;
   immediateError?: BrokerError;
   ttlMs?: number;
   audit?: AuditSink;
@@ -149,7 +187,10 @@ function createFixture(options: {
     jiraKey: "TAIA-42",
   };
   const policy = {
-    authorize: async () => context,
+    authorize: async () => {
+      if (options.authorizeError) throw options.authorizeError;
+      return context;
+    },
     immediatePreflight: async () => {
       if (options.immediateError) throw options.immediateError;
       return context;

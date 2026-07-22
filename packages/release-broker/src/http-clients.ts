@@ -39,6 +39,18 @@ function integer(value: unknown): number {
   return value as number;
 }
 
+function positiveInteger(value: unknown): number {
+  const parsed = integer(value);
+  if (parsed <= 0) throw new BrokerError("ambiguous_response", 503);
+  return parsed;
+}
+
+function nonNegativeInteger(value: unknown): number {
+  const parsed = integer(value);
+  if (parsed < 0) throw new BrokerError("ambiguous_response", 503);
+  return parsed;
+}
+
 function boolean(value: unknown): boolean {
   if (typeof value !== "boolean") throw new BrokerError("ambiguous_response", 503);
   return value;
@@ -165,7 +177,8 @@ export class PaperclipApiClient implements PaperclipReader {
   async getComment(issueId: string, commentId: string): Promise<PaperclipComment | null> {
     const url = this.#url(`/api/issues/${encodeURIComponent(issueId)}/comments/${encodeURIComponent(commentId)}`);
     const payload = await fetchJson(url, { headers: this.#headers }, new Set([200, 404]));
-    if (object(payload).error && object(payload).status === 404) return null;
+    const input = object(payload);
+    if (Object.keys(input).length === 1 && input.error === "Comment not found") return null;
     return parseComment(payload, issueId);
   }
 
@@ -245,7 +258,7 @@ export class GitLabApiClient implements GitLabMerger {
       { headers: this.#headers },
       new Set([200]),
     ));
-    const returnedIid = integer(input.iid);
+    const returnedIid = positiveInteger(input.iid);
     if (returnedIid !== iid) throw new BrokerError("ambiguous_response", 503);
     const pipeline = input.head_pipeline === null ? null : object(input.head_pipeline);
     return {
@@ -258,8 +271,8 @@ export class GitLabApiClient implements GitLabMerger {
       sha: string(input.sha),
       merge_status: string(input.merge_status),
       has_conflicts: boolean(input.has_conflicts),
-      diverged_commits_count: integer(input.diverged_commits_count),
-      head_pipeline: pipeline ? { id: integer(pipeline.id), status: string(pipeline.status) } : null,
+      diverged_commits_count: nonNegativeInteger(input.diverged_commits_count),
+      head_pipeline: pipeline ? { id: positiveInteger(pipeline.id), status: string(pipeline.status) } : null,
       merge_commit_sha: input.merge_commit_sha === undefined ? null : nullableString(input.merge_commit_sha),
       squash_commit_sha: input.squash_commit_sha === undefined ? null : nullableString(input.squash_commit_sha),
     };
@@ -271,7 +284,7 @@ export class GitLabApiClient implements GitLabMerger {
       { headers: this.#headers },
       new Set([200]),
     ));
-    const id = integer(input.id);
+    const id = positiveInteger(input.id);
     if (id !== pipelineId) throw new BrokerError("ambiguous_response", 503);
     return {
       id,

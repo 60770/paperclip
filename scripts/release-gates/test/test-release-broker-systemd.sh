@@ -37,4 +37,17 @@ if grep -Eq 'Environment=.*(TOKEN|KEY|SECRET)=' "$unit"; then
   exit 1
 fi
 
+for installer in \
+  "$repo_root/deploy/release-broker/install-release-broker.sh" \
+  "$repo_root/deploy/release-broker/install-releasebot-client.sh"; do
+  grep -Fq 'verifier="/usr/local/libexec/gotto-release-broker-verify"' "$installer" || {
+    printf 'installer verifier path drift: %s\n' "$installer" >&2
+    exit 1
+  }
+  grep -Fq 'flock -n 9' "$installer" || {
+    printf 'installer lock missing: %s\n' "$installer" >&2
+    exit 1
+  }
+done
+
 printf 'release broker systemd regression: ok\n'

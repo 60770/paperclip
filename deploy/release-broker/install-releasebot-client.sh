@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 
 set -euo pipefail
+umask 077
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
 
 [[ "${EUID:-$(id -u)}" -eq 0 ]] || {
   printf 'installer must run as root\n' >&2
@@ -18,13 +20,17 @@ bundle="$(realpath -e -- "$1")"
   exit 2
 }
 
-script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
-verifier="$script_dir/verify-release-bundle.py"
+verifier="/usr/local/libexec/gotto-release-broker-verify"
 public_key="/etc/gotto/releasebot-client/ed25519.pub"
 generation_state="/var/lib/gotto-releasebot-client-control/generation.json"
 release_root="/opt/gotto/releasebot-client"
 releases="$release_root/releases"
 binding_dir="/opt/gotto/releasebot-binding"
+exec 9>/run/lock/gotto-releasebot-client-install.lock
+flock -n 9 || {
+  printf 'another ReleaseBot client install is active\n' >&2
+  exit 21
+}
 [[ "$(stat -c '%u:%g:%a' "$public_key")" == "0:0:444" ]] || {
   printf 'invalid public key ownership or mode\n' >&2
   exit 21

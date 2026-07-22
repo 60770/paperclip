@@ -4,6 +4,9 @@ import type { ServerOptions } from "node:https";
 import { isUuid } from "./validation.js";
 
 const FINGERPRINT = /^sha256:[0-9a-f]{64}$/;
+const GITLAB_PROJECT_ID = 92;
+const GITLAB_ORIGIN = "https://gitlab.tidycode.it";
+const MAIN_LOCK_ISSUE = "GOT-66";
 
 export interface ServiceConfig {
   host: string;
@@ -35,6 +38,9 @@ export async function loadServiceConfig(environment: NodeJS.ProcessEnv = process
   if (!isUuid(companyId) || !isUuid(releaseBotAgentId)) throw new Error("Invalid broker identity configuration");
 
   const gitlabProjectId = positiveInteger(environment.BROKER_GITLAB_PROJECT_ID ?? "92", "BROKER_GITLAB_PROJECT_ID");
+  if (gitlabProjectId !== GITLAB_PROJECT_ID) throw new Error("Invalid BROKER_GITLAB_PROJECT_ID");
+  const mainLockIssue = environment.BROKER_MAIN_LOCK_ISSUE ?? MAIN_LOCK_ISSUE;
+  if (mainLockIssue !== MAIN_LOCK_ISSUE) throw new Error("Invalid BROKER_MAIN_LOCK_ISSUE");
   const port = positiveInteger(environment.BROKER_PORT ?? "9443", "BROKER_PORT");
   if (port > 65535) throw new Error("Invalid BROKER_PORT");
   const capabilityTtlMs = positiveInteger(environment.BROKER_CAPABILITY_TTL_MS ?? "20000", "BROKER_CAPABILITY_TTL_MS");
@@ -42,6 +48,7 @@ export async function loadServiceConfig(environment: NodeJS.ProcessEnv = process
 
   const paperclipApiUrl = secureUrl(required(environment.BROKER_PAPERCLIP_API_URL, "BROKER_PAPERCLIP_API_URL"));
   const gitlabApiUrl = secureUrl(required(environment.BROKER_GITLAB_API_URL, "BROKER_GITLAB_API_URL"));
+  if (new URL(gitlabApiUrl).origin !== GITLAB_ORIGIN) throw new Error("Invalid BROKER_GITLAB_API_URL");
   const identities = new Set(
     required(environment.BROKER_ALLOWED_CLIENT_FINGERPRINTS, "BROKER_ALLOWED_CLIENT_FINGERPRINTS")
       .split(",")
@@ -61,7 +68,7 @@ export async function loadServiceConfig(environment: NodeJS.ProcessEnv = process
     companyId,
     gitlabProjectId,
     releaseBotAgentId,
-    mainLockIssue: environment.BROKER_MAIN_LOCK_ISSUE ?? "GOT-66",
+    mainLockIssue,
     allowedClientIdentities: identities,
     capabilityTtlMs,
     paperclipApiUrl,
