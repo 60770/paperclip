@@ -696,6 +696,11 @@ async function streamLocalFileToSsh(input: {
       ssh.kill("SIGTERM");
       reject(error);
     };
+    const stdioGuard = installChildProcessStdioErrorHandlers(ssh, {
+      onUnexpectedError: ({ error, stream }) => {
+        fail(new Error(`SSH upload ${stream} stream failed: ${error.message}`));
+      },
+    });
 
     ssh.stderr?.on("data", (chunk) => {
       sshStderr += String(chunk);
@@ -709,6 +714,7 @@ async function streamLocalFileToSsh(input: {
       source.pipe(ssh.stdin ?? null);
     }
     ssh.on("close", (code) => {
+      stdioGuard.dispose();
       if (settled) return;
       settled = true;
       if ((code ?? 0) !== 0) {
@@ -751,6 +757,11 @@ async function streamSshToLocalFile(input: {
       sink.destroy();
       reject(error);
     };
+    const stdioGuard = installChildProcessStdioErrorHandlers(ssh, {
+      onUnexpectedError: ({ error, stream }) => {
+        fail(new Error(`SSH download ${stream} stream failed: ${error.message}`));
+      },
+    });
 
     if (input.progress) {
       input.progress.counter.on("error", fail);
@@ -764,6 +775,7 @@ async function streamSshToLocalFile(input: {
     ssh.on("error", fail);
     sink.on("error", fail);
     ssh.on("close", (code) => {
+      stdioGuard.dispose();
       sink.end(() => {
         if (settled) return;
         settled = true;
@@ -1361,6 +1373,16 @@ export async function syncDirectoryToSsh(input: {
       ssh.kill("SIGTERM");
       reject(error);
     };
+    const tarStdioGuard = installChildProcessStdioErrorHandlers(tar, {
+      onUnexpectedError: ({ error, stream }) => {
+        fail(new Error(`tar ${stream} stream failed during SSH upload: ${error.message}`));
+      },
+    });
+    const sshStdioGuard = installChildProcessStdioErrorHandlers(ssh, {
+      onUnexpectedError: ({ error, stream }) => {
+        fail(new Error(`SSH upload ${stream} stream failed: ${error.message}`));
+      },
+    });
 
     if (progress) {
       progress.counter.on("error", fail);
@@ -1378,11 +1400,13 @@ export async function syncDirectoryToSsh(input: {
     tar.on("error", fail);
     ssh.on("error", fail);
     tar.on("close", (code) => {
+      tarStdioGuard.dispose();
       tarExited = true;
       tarExitCode = code;
       maybeFinish();
     });
     ssh.on("close", (code) => {
+      sshStdioGuard.dispose();
       sshExited = true;
       sshExitCode = code;
       maybeFinish();
@@ -1472,6 +1496,16 @@ export async function syncDirectoryFromSsh(input: {
         tar.kill("SIGTERM");
         reject(error);
       };
+      const sshStdioGuard = installChildProcessStdioErrorHandlers(ssh, {
+        onUnexpectedError: ({ error, stream }) => {
+          fail(new Error(`SSH download ${stream} stream failed: ${error.message}`));
+        },
+      });
+      const tarStdioGuard = installChildProcessStdioErrorHandlers(tar, {
+        onUnexpectedError: ({ error, stream }) => {
+          fail(new Error(`tar ${stream} stream failed during SSH download: ${error.message}`));
+        },
+      });
 
       if (progress) {
         progress.counter.on("error", fail);
@@ -1489,11 +1523,13 @@ export async function syncDirectoryFromSsh(input: {
       ssh.on("error", fail);
       tar.on("error", fail);
       ssh.on("close", (code) => {
+        sshStdioGuard.dispose();
         sshExited = true;
         sshExitCode = code;
         maybeFinish();
       });
       tar.on("close", (code) => {
+        tarStdioGuard.dispose();
         tarExited = true;
         tarExitCode = code;
         maybeFinish();
