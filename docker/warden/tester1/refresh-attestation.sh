@@ -15,7 +15,14 @@ elif [[ "$#" -ne 0 ]]; then
   fail "Usage: $0 --live-dir <path>"
 fi
 [[ -n "${live_dir}" && -f "${live_dir}/.env" ]] || fail "Live Warden .env is required to render config."
-[[ ! -e "${ROOT_DIR}/.env" ]] || fail "Canonical source must not contain a live .env file."
+for runtime_only_path in \
+  .env \
+  .warden/runner/authorized_keys \
+  .warden/runner/ssh_host_ed25519_key \
+  .warden/runner/ssh_host_ed25519_key.pub; do
+  [[ ! -e "${ROOT_DIR}/${runtime_only_path}" && ! -L "${ROOT_DIR}/${runtime_only_path}" ]] \
+    || fail "Canonical source must not contain runtime-only path: ${runtime_only_path}"
+done
 
 warden_bin="${WARDEN_BIN:-/opt/warden/bin/warden}"
 [[ -x "${warden_bin}" ]] || fail "Warden executable is unavailable: ${warden_bin}"

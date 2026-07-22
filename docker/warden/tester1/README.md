@@ -43,7 +43,8 @@ non-rebuild operations and boundary verification:
 ```
 
 `test-attestation-gate.sh` mutates a verifier and the Warden config in isolated
-fixtures and proves both changes are rejected before Warden is invoked.
+fixtures, injects runtime-only SSH material into a source manifest, and proves
+each change is rejected before Warden invocation or live-file writes.
 
 ## Security boundary
 

@@ -68,6 +68,11 @@ while IFS= read -r line; do
   relative_path="${BASH_REMATCH[2]}"
   [[ "${relative_path}" != /* && "${relative_path}" != .. && "${relative_path}" != ../* && "${relative_path}" != */../* ]] \
     || fail "Unsafe source manifest path: ${relative_path}"
+  case "${relative_path}" in
+    .env|.warden/runner/authorized_keys|.warden/runner/ssh_host_ed25519_key|.warden/runner/ssh_host_ed25519_key.pub)
+      fail "Runtime-only path is forbidden in source manifest: ${relative_path}"
+      ;;
+  esac
   manifest_files+=("${relative_path}")
 done <"${manifest_path}"
 [[ "${#manifest_files[@]}" -gt 0 ]] || fail "Source manifest is empty."

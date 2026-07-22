@@ -93,6 +93,63 @@ run_env=(
   FAKE_BUILD_MARKER="${TEMP_ROOT}/warden-build-invoked"
 )
 
+cp -a "${TEMP_ROOT}/repo" "${TEMP_ROOT}/runtime-manifest-repo"
+runtime_manifest_dir="${TEMP_ROOT}/runtime-manifest-repo/docker/warden/tester1"
+printf 'ssh-ed25519 AAAAVERSIONED invalid\n' \
+  >"${runtime_manifest_dir}/.warden/runner/authorized_keys"
+(
+  cd -- "${runtime_manifest_dir}"
+  find . -type f ! -path './attestation/source-manifest.sha256' -print0 \
+    | LC_ALL=C sort -z \
+    | xargs -0 sha256sum
+) | sed 's#  \./#  #' >"${TEMP_ROOT}/runtime-source-manifest.sha256"
+mv "${TEMP_ROOT}/runtime-source-manifest.sha256" \
+  "${runtime_manifest_dir}/attestation/source-manifest.sha256"
+git -C "${TEMP_ROOT}/runtime-manifest-repo" add docker/warden/tester1
+git -C "${TEMP_ROOT}/runtime-manifest-repo" \
+  -c user.name='Attestation Test' \
+  -c user.email='attestation-test@example.invalid' \
+  commit -qm 'test runtime-only manifest fixture'
+
+runtime_live="${TEMP_ROOT}/runtime-live"
+mkdir -p "${runtime_live}"
+cp -a "${runtime_manifest_dir}/." "${runtime_live}/"
+printf 'WARDEN_ENV_NAME=paperclip-tester1\n' >"${runtime_live}/.env"
+printf 'ssh-ed25519 AAAASENTINEL runtime\n' \
+  >"${runtime_live}/.warden/runner/authorized_keys"
+cp "${runtime_live}/.warden/runner/authorized_keys" \
+  "${TEMP_ROOT}/authorized-keys-sentinel"
+rm -f \
+  "${runtime_live}/.warden/runner/ssh_host_ed25519_key" \
+  "${runtime_live}/.warden/runner/ssh_host_ed25519_key.pub"
+if output="$(env "${run_env[@]}" \
+  "${runtime_manifest_dir}/sync-live-source.sh" --live-dir "${runtime_live}" 2>&1)"; then
+  fail "Sync accepted a runtime-only path in the source manifest."
+fi
+grep -q 'Runtime-only path is forbidden in source manifest: .warden/runner/authorized_keys' <<<"${output}" \
+  || fail "Runtime-only manifest path failed for an unexpected reason: ${output}"
+cmp -s "${TEMP_ROOT}/authorized-keys-sentinel" \
+  "${runtime_live}/.warden/runner/authorized_keys" \
+  || fail "Sync changed runtime authorized_keys before rejecting the manifest."
+printf 'PASS: runtime-only manifest path is rejected before live writes.\n'
+
+printf '%064d\n' 7 >"${runtime_manifest_dir}/attestation/rendered-config.sha256"
+cp "${runtime_manifest_dir}/attestation/rendered-config.sha256" \
+  "${TEMP_ROOT}/rendered-config-sentinel"
+rm -f "${TEMP_ROOT}/warden-rendered"
+if output="$(env "${run_env[@]}" \
+  "${runtime_manifest_dir}/refresh-attestation.sh" --live-dir "${runtime_live}" 2>&1)"; then
+  fail "Refresh accepted runtime-only canonical source."
+fi
+grep -q 'Canonical source must not contain runtime-only path: .warden/runner/authorized_keys' <<<"${output}" \
+  || fail "Runtime-only refresh path failed for an unexpected reason: ${output}"
+cmp -s "${TEMP_ROOT}/rendered-config-sentinel" \
+  "${runtime_manifest_dir}/attestation/rendered-config.sha256" \
+  || fail "Refresh changed attestation output before rejecting runtime-only source."
+[[ ! -e "${TEMP_ROOT}/warden-rendered" ]] \
+  || fail "Warden rendered config before refresh rejected runtime-only source."
+printf 'PASS: refresh rejects runtime-only source before attestation writes.\n'
+
 prepare_live
 source_sha256="$(sha256sum "${canonical_dir}/attestation/source-manifest.sha256" | awk '{print $1}')"
 rendered_sha256="$(tr -d '[:space:]' <"${canonical_dir}/attestation/rendered-config.sha256")"
