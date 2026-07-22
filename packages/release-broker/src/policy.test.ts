@@ -153,9 +153,25 @@ describe("ReleasePolicy", () => {
     "[MEDIUM](https://example.invalid): authorization bypass remains",
     "![CRITICAL](badge): authorization bypass remains",
     "### <HIGH>: authorization bypass remains",
+    "[**HIGH**](https://example.invalid): authorization bypass remains",
+    "[`CRITICAL`](https://example.invalid): authorization bypass remains",
+    "![**CRITICAL**](badge): authorization bypass remains",
+    "![`HIGH`](badge): authorization bypass remains",
+    "[__MEDIUM__]: authorization bypass remains",
+    "<**BLOCKER**>: authorization bypass remains",
     "> HIGH: authorization bypass remains",
     "```text\nCRITICAL: authorization bypass remains\n```",
   ])("rejects Markdown-equivalent security findings: %s", async (finding) => {
+    paperclip.comments.get(ISSUE)![1]!.body =
+      `APPROVED-REVIEW\n\n${finding}\nAPPROVED-QA-WAIVED: Backend-only broker\n\ncc [@ReleaseBot](agent://${RELEASE_BOT})`;
+    await expect(policy(paperclip, gitlab).authorize(REQUEST))
+      .rejects.toMatchObject({ code: "paperclip_not_ready" });
+  });
+
+  it.each([
+    "[**HIGH**: malformed wrapper",
+    "<`CRITICAL`: malformed wrapper",
+  ])("fails closed on a malformed security wrapper: %s", async (finding) => {
     paperclip.comments.get(ISSUE)![1]!.body =
       `APPROVED-REVIEW\n\n${finding}\nAPPROVED-QA-WAIVED: Backend-only broker\n\ncc [@ReleaseBot](agent://${RELEASE_BOT})`;
     await expect(policy(paperclip, gitlab).authorize(REQUEST))

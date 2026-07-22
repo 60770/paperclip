@@ -110,14 +110,19 @@ function hasSecurityFinding(lines: string[]): boolean {
   return lines.some(hasSecurityFindingLine);
 }
 
-// Grammar: up to eight total list, task-list, heading, emphasis, or inline-code
-// containers, followed by a severity label. Excess depth and severity-like
-// labels hidden by other Markdown forms fail closed.
+// Grammar: up to eight total list, task-list, heading, emphasis, inline-code,
+// link/image-label, or angle-bracket containers followed by a severity label.
+// Wrapper contents are normalized recursively; malformed forms and excess
+// depth fail closed.
 function hasSecurityFindingLine(line: string): boolean {
-  let normalized = line.trimStart();
+  return hasSecurityLabelInMarkdown(line.trimStart(), MAX_SECURITY_MARKDOWN_DEPTH);
+}
+
+function hasSecurityLabelInMarkdown(value: string, remainingDepth: number): boolean {
+  let normalized = value;
   let depth = 0;
 
-  while (depth < MAX_SECURITY_MARKDOWN_DEPTH) {
+  while (depth < remainingDepth) {
     const next = stripSecurityMarkdownContainer(normalized);
     if (next === null) break;
     normalized = next.trimStart();
@@ -125,8 +130,9 @@ function hasSecurityFindingLine(line: string): boolean {
   }
 
   if (stripSecurityMarkdownContainer(normalized) !== null) return true;
-  if (hasAllowlistedSecurityLabel(normalized, MAX_SECURITY_MARKDOWN_DEPTH - depth)) return true;
-  return hasAmbiguousSecurityLabel(normalized);
+  const availableDepth = remainingDepth - depth;
+  if (hasAllowlistedSecurityLabel(normalized, availableDepth)) return true;
+  return hasAmbiguousSecurityLabel(normalized, availableDepth);
 }
 
 function stripSecurityMarkdownContainer(value: string): string | null {
@@ -150,7 +156,7 @@ function hasAllowlistedSecurityLabel(value: string, remainingDepth: number): boo
     const marker = value[offset]!;
     let length = 1;
     while (value[offset + length] === marker) length += 1;
-    if (length > 3) return hasAmbiguousSecurityLabel(value);
+    if (length > 3) return hasAmbiguousSecurityLabel(value, remainingDepth);
     if (closers.length >= remainingDepth) return true;
     const delimiter = marker.repeat(length);
     closers.push(delimiter);
@@ -172,19 +178,28 @@ function hasAllowlistedSecurityLabel(value: string, remainingDepth: number): boo
   return !/^[A-Za-z0-9]/.test(suffix);
 }
 
-function hasAmbiguousSecurityLabel(value: string): boolean {
+function hasAmbiguousSecurityLabel(value: string, remainingDepth: number): boolean {
   let candidate = value;
 
-  for (let depth = 0; depth < MAX_SECURITY_MARKDOWN_DEPTH; depth += 1) {
-    const wrapper = /^(?:<([^>\n]{1,64})>|\[([^\]\n]{0,32})\])/.exec(candidate);
+  for (let depth = 0; depth < remainingDepth; depth += 1) {
+    const wrapper = /^(?:!?\[([^\]\n]{0,32})\]|<([^>\n]{1,64})>)/.exec(candidate);
     const wrappedLabel = wrapper?.[1] ?? wrapper?.[2];
-    if (wrappedLabel && hasSecurityLabelCandidate(wrappedLabel.trimStart())) return true;
+    if (wrappedLabel !== undefined) {
+      if (hasSecurityLabelInMarkdown(wrappedLabel.trimStart(), remainingDepth - depth - 1)) {
+        return true;
+      }
+      candidate = candidate.slice(wrapper![0].length);
+      continue;
+    }
+
+    if (/^(?:!?\[|<)/.test(candidate)) return true;
 
     const prefix = AMBIGUOUS_SECURITY_PREFIX.exec(candidate);
     if (!prefix) break;
     candidate = candidate.slice(prefix[0].length);
   }
 
+  if (/^(?:!?\[|<)/.test(candidate)) return true;
   if (AMBIGUOUS_SECURITY_PREFIX.test(candidate)) return true;
   return hasSecurityLabelCandidate(candidate);
 }

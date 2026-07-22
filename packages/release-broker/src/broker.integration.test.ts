@@ -132,6 +132,12 @@ describe("release broker GitLab integration", () => {
     "[MEDIUM](https://example.invalid): authorization bypass remains",
     "![CRITICAL](badge): authorization bypass remains",
     "### <HIGH>: authorization bypass remains",
+    "[**HIGH**](https://example.invalid): authorization bypass remains",
+    "[`CRITICAL`](https://example.invalid): authorization bypass remains",
+    "![**CRITICAL**](badge): authorization bypass remains",
+    "![`HIGH`](badge): authorization bypass remains",
+    "[__MEDIUM__]: authorization bypass remains",
+    "<**BLOCKER**>: authorization bypass remains",
     "> HIGH: authorization bypass remains",
     "```text\nCRITICAL: authorization bypass remains\n```",
   ])("keeps merge PUT at zero for a Markdown security finding: %s", async (finding) => {
