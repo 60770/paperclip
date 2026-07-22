@@ -392,6 +392,7 @@ async function createSshAuthArgs(
 ): Promise<{ args: string[]; cleanup: () => Promise<void> }> {
   const tempFiles: Array<() => Promise<void>> = [];
   const sshArgs = [
+    ...(config.privateKey ? ["-F", "none"] : []),
     "-o",
     "BatchMode=yes",
     "-o",

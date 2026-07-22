@@ -33,6 +33,26 @@ async function git(cwd: string, args: string[]): Promise<string> {
   });
 }
 
+async function readEffectiveSshConfig(args: string[]): Promise<string> {
+  return await new Promise((resolve, reject) => {
+    execFile("ssh", ["-G", ...args], (error, stdout, stderr) => {
+      if (error) {
+        reject(new Error((stderr || stdout || error.message).trim()));
+        return;
+      }
+      resolve(stdout);
+    });
+  });
+}
+
+function sshConfigValues(output: string, key: string): string[] {
+  const prefix = `${key} `;
+  return output
+    .split("\n")
+    .filter((line) => line.startsWith(prefix))
+    .map((line) => line.slice(prefix.length));
+}
+
 async function startSshEnvLabFixtureOrSkip(statePath: string, label: string) {
   if (sshEnvLabUnsupportedReason) {
     console.warn(`Skipping ${label}: ${sshEnvLabUnsupportedReason}`);
@@ -192,7 +212,79 @@ describe("ssh env-lab fixture", () => {
     ).rejects.toThrow("Invalid SSH environment variable key: BAD KEY");
   });
 
-  it("associates IdentitiesOnly with the materialized configured private key", async () => {
+  it("builds isolated private-key authentication args and cleans up temp files", async () => {
+    const target = await buildSshSpawnTarget({
+      spec: {
+        host: "ssh.example.test",
+        port: 22,
+        username: "ssh-user",
+        remoteCwd: "/srv/paperclip/workspace",
+        remoteWorkspacePath: "/srv/paperclip/workspace",
+        privateKey: "test-private-key",
+        knownHosts: "ssh.example.test ssh-ed25519 test-host-key",
+        strictHostKeyChecking: true,
+      },
+      command: "env",
+      args: [],
+      env: {},
+    });
+
+    const privateKeyIndex = target.args.indexOf("-i");
+    const privateKeyPath = target.args[privateKeyIndex + 1]!;
+    const knownHostsArg = target.args.find((arg) => arg.startsWith("UserKnownHostsFile="))!;
+    const knownHostsPath = knownHostsArg.slice("UserKnownHostsFile=".length);
+
+    try {
+      expect(target.args.slice(0, privateKeyIndex + 2)).toEqual([
+        "-F",
+        "none",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ConnectTimeout=10",
+        "-o",
+        "StrictHostKeyChecking=yes",
+        "-o",
+        knownHostsArg,
+        "-o",
+        "IdentitiesOnly=yes",
+        "-i",
+        privateKeyPath,
+      ]);
+    } finally {
+      await target.cleanup();
+    }
+
+    await expect(readFile(privateKeyPath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(readFile(knownHostsPath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("excludes IdentityFile and ProxyJump from SSH config with a managed private key", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-config-"));
+    cleanupDirs.push(rootDir);
+    const decoyKeyPath = path.join(rootDir, "decoy-key");
+    const sshConfigPath = path.join(rootDir, "config");
+    await writeFile(decoyKeyPath, "decoy-private-key\n", { mode: 0o600 });
+    await writeFile(
+      sshConfigPath,
+      [
+        "Host ssh.example.test",
+        `  IdentityFile ${JSON.stringify(decoyKeyPath)}`,
+        "  ProxyJump jump.example.test",
+        "",
+      ].join("\n"),
+      { mode: 0o600 },
+    );
+
+    const control = await readEffectiveSshConfig([
+      "-F",
+      sshConfigPath,
+      "-p",
+      "22",
+      "ssh-user@ssh.example.test",
+    ]);
+    expect(sshConfigValues(control, "identityfile")).toContain(decoyKeyPath);
+    expect(sshConfigValues(control, "proxyjump")).toEqual(["jump.example.test"]);
     const target = await buildSshSpawnTarget({
       spec: {
         host: "ssh.example.test",
@@ -210,21 +302,33 @@ describe("ssh env-lab fixture", () => {
     });
 
     try {
-      const identityFileIndex = target.args.indexOf("-i");
-      expect(target.args.slice(identityFileIndex - 2, identityFileIndex + 1)).toEqual([
-        "-o",
-        "IdentitiesOnly=yes",
-        "-i",
-      ]);
-      const identityFile = target.args[identityFileIndex + 1]!;
-      expect(identityFile).toMatch(/paperclip-ssh-key-/);
-      await expect(readFile(identityFile, "utf8")).resolves.toBe("test-private-key\n");
+      const privateKeyPath = target.args[target.args.indexOf("-i") + 1]!;
+      const isolated = await readEffectiveSshConfig(target.args);
+      expect(sshConfigValues(isolated, "identityfile")).toEqual([privateKeyPath]);
+      expect(sshConfigValues(isolated, "identityfile")).not.toContain(decoyKeyPath);
+      expect(sshConfigValues(isolated, "proxyjump")).toEqual([]);
     } finally {
       await target.cleanup();
     }
   });
 
-  it("preserves default SSH identity fallback without a configured private key", async () => {
+  it("preserves SSH config fallback without a managed private key", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-config-"));
+    cleanupDirs.push(rootDir);
+    const decoyKeyPath = path.join(rootDir, "decoy-key");
+    const sshConfigPath = path.join(rootDir, "config");
+    await writeFile(decoyKeyPath, "decoy-private-key\n", { mode: 0o600 });
+    await writeFile(
+      sshConfigPath,
+      [
+        "Host ssh.example.test",
+        `  IdentityFile ${JSON.stringify(decoyKeyPath)}`,
+        "  ProxyJump jump.example.test",
+        "",
+      ].join("\n"),
+      { mode: 0o600 },
+    );
+
     const target = await buildSshSpawnTarget({
       spec: {
         host: "ssh.example.test",
@@ -234,7 +338,7 @@ describe("ssh env-lab fixture", () => {
         remoteWorkspacePath: "/srv/paperclip/workspace",
         privateKey: null,
         knownHosts: null,
-        strictHostKeyChecking: true,
+        strictHostKeyChecking: false,
       },
       command: "env",
       args: [],
@@ -242,8 +346,23 @@ describe("ssh env-lab fixture", () => {
     });
 
     try {
+      expect(target.args.slice(0, 8)).toEqual([
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ConnectTimeout=10",
+        "-o",
+        "StrictHostKeyChecking=no",
+        "-o",
+        "UserKnownHostsFile=/dev/null",
+      ]);
+      expect(target.args).not.toContain("-F");
       expect(target.args).not.toContain("IdentitiesOnly=yes");
       expect(target.args).not.toContain("-i");
+
+      const effective = await readEffectiveSshConfig(["-F", sshConfigPath, ...target.args]);
+      expect(sshConfigValues(effective, "identityfile")).toContain(decoyKeyPath);
+      expect(sshConfigValues(effective, "proxyjump")).toEqual(["jump.example.test"]);
     } finally {
       await target.cleanup();
     }
