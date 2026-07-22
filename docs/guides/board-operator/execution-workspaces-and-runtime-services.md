@@ -75,6 +75,23 @@ Code state moves between runs through the local execution-workspace cwd alone â€
 
 The invariant is enforced by the "no-remote-git contract" case in `packages/adapter-utils/src/ssh-fixture.test.ts`, which asserts a remote-only commit reaches the local worktree with no remote configured at any point.
 
+## SSH identity and local configuration
+
+When an SSH environment uses a Paperclip-managed private key, Paperclip treats
+the configured host, port, username, host-key policy, and known-hosts data as the
+complete connection contract. The SSH process does not read local or system
+`ssh_config`, so directives such as `IdentityFile`, `ProxyJump`, `ProxyCommand`,
+and `HostName` aliases are not inherited.
+
+Without a managed private key, Paperclip preserves OpenSSH's normal local
+configuration and identity fallback. This compatibility is intentional for
+operators who rely on an SSH agent or local `ssh_config`.
+
+`ProxyJump` is not currently a first-class SSH environment field. It is
+therefore unavailable with a Paperclip-managed private key until explicit proxy
+routing support is added; do not depend on a hidden local `ssh_config` directive
+for that path.
+
 ## Current implementation guarantees
 
 With the current implementation:
