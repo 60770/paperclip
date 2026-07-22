@@ -24,7 +24,7 @@ const MAIN_UNLOCK = "[MAIN_UNLOCKED]:";
 const HUMAN_REQUIRED = /^\[HUMAN_DECISION_REQUIRED\]:/m;
 const HUMAN_UNBLOCKED = /^\[HUMAN_DECISION_UNBLOCKED\]:[^\n]*\bvia=([^\s]+)/m;
 const SECURITY_SEVERITY = /^(?:BLOCKER|MEDIUM|HIGH|CRITICAL)/i;
-const SECURITY_FINDING_SEPARATOR = /^(?:\s*(?::|[–—])|\s+|$)/;
+const SECURITY_FINDING_SEPARATOR = /^(?:\s*(?::|[–—])|-(?=\s|$)|\s+|$)/;
 const AMBIGUOUS_SECURITY_PREFIX = /^(?:<[^>\n]{1,64}>|\[[^\]\n]{0,32}\]|[^A-Za-z0-9<\[]+)[ \t]*/;
 const MAX_SECURITY_MARKDOWN_DEPTH = 8;
 

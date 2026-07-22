@@ -126,6 +126,7 @@ describe("release broker GitLab integration", () => {
     "- - ### **HIGH**: authorization bypass remains",
     "### `CRITICAL`: authorization bypass remains",
     "### HIGH: authorization bypass remains",
+    "### HIGH- authorization bypass remains",
     "- MEDIUM: authorization bypass remains",
     "### [HIGH]: authorization bypass remains",
     "[MEDIUM](https://example.invalid): authorization bypass remains",

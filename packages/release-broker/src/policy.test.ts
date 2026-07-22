@@ -140,6 +140,7 @@ describe("ReleasePolicy", () => {
     "#### BLOCKER — authorization bypass remains",
     "- ### **HIGH**: authorization bypass remains",
     "### HIGH - authorization bypass remains",
+    "### HIGH- authorization bypass remains",
     "- MEDIUM: authorization bypass remains",
     "### CRITICAL — authorization bypass remains",
     "- [ ] ### **HIGH**: authorization bypass remains",
