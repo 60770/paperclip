@@ -1,0 +1,24 @@
+{
+  "name": "@paperclipai/release-broker",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "paperclip-release-broker": "./dist/cli.js",
+    "paperclip-release-broker-client": "./dist/client-cli.js"
+  },
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "clean": "rm -rf dist",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^22.19.21",
+    "typescript": "^5.7.3",
+    "vitest": "^4.1.8"
+  }
+}

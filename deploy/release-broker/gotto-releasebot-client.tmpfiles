@@ -1,0 +1,6 @@
+d /opt/gotto/releasebot-client 0555 root root -
+d /opt/gotto/releasebot-client/releases 0555 root root -
+d /opt/gotto/releasebot-binding 0555 root root -
+d /var/lib/gotto-releasebot-client-control 0555 root root -
+d /var/lib/gotto-releasebot-client-incoming 0700 root root -
+d /etc/gotto/releasebot-client 0555 root root -

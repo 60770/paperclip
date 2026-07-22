@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+command_name="${1:-}"
+shift || true
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+payload_root="$(cd "$script_dir/../../../.." && pwd -P)"
+release_root="$(cd "$payload_root/.." && pwd -P)"
+public_key="${BROKER_ATTESTATION_PUBLIC_KEY:-/etc/gotto/release-broker/ed25519.pub}"
+generation="${BROKER_GATE_GENERATION:?BROKER_GATE_GENERATION is required}"
+generation_state="${BROKER_GENERATION_STATE:-/var/lib/gotto-release-broker-control/generation.json}"
+
+node "$payload_root/packages/release-broker/dist/attestation-cli.js" verify \
+  "$payload_root" \
+  "$release_root/manifest.json" \
+  "$release_root/manifest.json.sig" \
+  "$public_key" \
+  "$generation" \
+  "$generation_state" >/dev/null || {
+    printf 'RELEASE_GATE_ERROR reason=attestation_failed\n' >&2
+    exit 21
+  }
+
+case "$command_name" in
+  human-preflight)
+    [[ "$#" -eq 1 ]] || {
+      printf 'HUMAN_GATE_ERROR reason=invalid_arguments\n' >&2
+      exit 21
+    }
+    exec "$script_dir/release-human-gate-preflight.sh" "$1"
+    ;;
+  main-lock)
+    [[ "$#" -eq 0 ]] || {
+      printf 'MAIN_LOCK_ERROR reason=invalid_arguments\n' >&2
+      exit 21
+    }
+    exec "$script_dir/release-main-lock-resolver.sh"
+    ;;
+  verify)
+    [[ "$#" -eq 0 ]] || {
+      printf 'RELEASE_GATE_ERROR reason=invalid_arguments\n' >&2
+      exit 21
+    }
+    printf 'RELEASE_GATE_CLEAR generation=%s\n' "$generation"
+    ;;
+  *)
+    printf 'RELEASE_GATE_ERROR reason=unknown_command\n' >&2
+    exit 21
+    ;;
+esac

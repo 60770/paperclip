@@ -1,0 +1,55 @@
+[Unit]
+Description=Gotto isolated release merge broker
+After=network-online.target
+Wants=network-online.target
+ConditionPathIsReadWrite=/var/log/gotto-release-broker
+
+[Service]
+Type=simple
+User=gotto-merge-broker
+Group=gotto-merge-broker
+EnvironmentFile=/etc/gotto/release-broker/broker.conf
+EnvironmentFile=/etc/gotto/release-broker/generation.conf
+LoadCredential=gitlab-merge-token:/etc/gotto/release-broker/credentials/gitlab-merge-token
+LoadCredential=paperclip-api-key:/etc/gotto/release-broker/credentials/paperclip-api-key
+LoadCredential=server-cert:/etc/gotto/release-broker/credentials/server-cert
+LoadCredential=server-key:/etc/gotto/release-broker/credentials/server-key
+LoadCredential=client-ca:/etc/gotto/release-broker/credentials/client-ca
+ExecStart=/usr/bin/node --jitless --disable-proto=throw /opt/gotto/release-broker/current/payload/packages/release-broker/dist/cli.js serve
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=15s
+UMask=0077
+
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateDevices=yes
+PrivateTmp=yes
+PrivateMounts=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+DevicePolicy=closed
+IPAddressDeny=any
+RemoveIPC=yes
+ReadOnlyPaths=/opt/gotto/release-broker /var/lib/gotto-release-broker-control
+ReadWritePaths=/var/log/gotto-release-broker
+
+[Install]
+WantedBy=multi-user.target

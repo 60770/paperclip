@@ -1,0 +1,7 @@
+d /opt/gotto/release-broker 0555 root root -
+d /opt/gotto/release-broker/releases 0555 root root -
+d /var/lib/gotto-release-broker-control 0555 root root -
+d /var/lib/gotto-release-broker-incoming 0700 root root -
+d /var/log/gotto-release-broker 0700 gotto-merge-broker gotto-merge-broker -
+d /etc/gotto/release-broker 0555 root root -
+d /etc/gotto/release-broker/credentials 0500 root root -

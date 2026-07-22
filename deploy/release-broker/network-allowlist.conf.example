@@ -1,0 +1,4 @@
+[Service]
+# Replace documentation ranges with trust-domain firewall-approved CIDRs.
+IPAddressAllow=192.0.2.10/32
+IPAddressAllow=198.51.100.20/32
