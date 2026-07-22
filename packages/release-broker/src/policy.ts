@@ -108,7 +108,7 @@ function hasSecurityFinding(lines: string[]): boolean {
       .replace(/^\s*(?:(?:[-*+]|\d+[.)])\s+)?/, "")
       .replace(/^#{1,6}(?:\s+|$)/, "")
       .replace(/[*_]/g, "");
-    return /^(?:BLOCKER|HIGH)(?:\s*(?::|[-–—])|\s+|$)/i.test(withoutList);
+    return /^(?:BLOCKER|HIGH)(?:\s*(?::|[–—])|\s+|$)/i.test(withoutList);
   });
 }
 

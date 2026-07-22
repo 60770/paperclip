@@ -139,6 +139,7 @@ describe("ReleasePolicy", () => {
     "### **HIGH**: authorization bypass remains",
     "#### BLOCKER — authorization bypass remains",
     "- ### **HIGH**: authorization bypass remains",
+    "### HIGH - authorization bypass remains",
   ])("rejects Markdown-equivalent security findings: %s", async (finding) => {
     paperclip.comments.get(ISSUE)![1]!.body =
       `APPROVED-REVIEW\n\n${finding}\nAPPROVED-QA-WAIVED: Backend-only broker\n\ncc [@ReleaseBot](agent://${RELEASE_BOT})`;
@@ -149,6 +150,12 @@ describe("ReleasePolicy", () => {
   it("accepts a non-finding Markdown heading", async () => {
     paperclip.comments.get(ISSUE)![1]!.body =
       `APPROVED-REVIEW\n\n### Review clean: no HIGH or BLOCKER findings remain\nAPPROVED-QA-WAIVED: Backend-only broker\n\ncc [@ReleaseBot](agent://${RELEASE_BOT})`;
+    await expect(policy(paperclip, gitlab).authorize(REQUEST)).resolves.toBeDefined();
+  });
+
+  it("accepts a hyphenated word at the start of a Markdown heading", async () => {
+    paperclip.comments.get(ISSUE)![1]!.body =
+      `APPROVED-REVIEW\n\n### High-level summary\nAPPROVED-QA-WAIVED: Backend-only broker\n\ncc [@ReleaseBot](agent://${RELEASE_BOT})`;
     await expect(policy(paperclip, gitlab).authorize(REQUEST)).resolves.toBeDefined();
   });
 
