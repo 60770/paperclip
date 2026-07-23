@@ -217,6 +217,7 @@ function parseAttachmentChunkRequest(
 ): { kind: "none" } | { kind: "invalid" } | { kind: "chunk"; length: number } {
   if (!ATTACHMENT_CONTENT_CHUNK_PATH.test(request.path)) return { kind: "none" };
   if (request.body.length > 0) return { kind: "invalid" };
+  if (typeof request.query !== "string") return { kind: "invalid" };
 
   const query = request.query.trim();
   const params = new URLSearchParams(query.startsWith("?") ? query.slice(1) : query);
