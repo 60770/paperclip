@@ -1,4 +1,5 @@
 import { execFile as execFileCallback } from "node:child_process";
+import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -7,6 +8,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { prepareCommandManagedRuntime } from "./command-managed-runtime.js";
 import {
+  decodeSandboxCallbackBridgeRequestBody,
   authorizeSandboxCallbackBridgeRequestWithRoutes,
   createCommandManagedSandboxCallbackBridgeQueueClient,
   createFileSystemSandboxCallbackBridgeQueueClient,
@@ -101,6 +103,38 @@ describe("sandbox callback bridge", () => {
     throw new Error(`Timed out waiting for a JSON file in ${directory}.`);
   }
 
+  function sha256Hex(input: Buffer): string {
+    return createHash("sha256").update(input).digest("hex");
+  }
+
+  it("decodes a 4 MiB base64 attachment body without stack overflow", () => {
+    const raw = Buffer.alloc(4 * 1024 * 1024, 0xab);
+    const encoded = raw.toString("base64");
+    const decoded = decodeSandboxCallbackBridgeRequestBody({
+      body: encoded,
+      bodyEncoding: "base64",
+    });
+    expect(decoded.byteLength).toBe(raw.byteLength);
+    expect(sha256Hex(decoded)).toBe(sha256Hex(raw));
+  });
+
+  it("decodes a near-cap base64 attachment body without stack overflow", () => {
+    const raw = Buffer.alloc(12 * 1024 * 1024 - 1024, 0xaa);
+    const encoded = raw.toString("base64");
+    const decoded = decodeSandboxCallbackBridgeRequestBody({
+      body: encoded,
+      bodyEncoding: "base64",
+    });
+    expect(decoded.byteLength).toBe(raw.byteLength);
+    expect(sha256Hex(decoded)).toBe(sha256Hex(raw));
+  });
+
+  it.each(["Zh==", "Zg=A", "Zg?"])("rejects non-canonical base64 attachment payload %s", (body) => {
+    expect(() => decodeSandboxCallbackBridgeRequestBody({ body, bodyEncoding: "base64" })).toThrow(
+      "Invalid base64 bridge request body.",
+    );
+  });
+
   afterEach(async () => {
     while (cleanupFns.length > 0) {
       const cleanup = cleanupFns.pop();
@@ -160,7 +194,10 @@ describe("sandbox callback bridge", () => {
       client: createFileSystemSandboxCallbackBridgeQueueClient(),
       queueDir,
       authorizeRequest: async (request) =>
-        request.path === "/api/agents/me" ? null : `Route not allowed: ${request.method} ${request.path}`,
+        request.path === "/api/agents/me" ||
+        (request.method === "DELETE" && request.path === "/api/attachments/attachment-1")
+          ? null
+          : `Route not allowed: ${request.method} ${request.path}`,
       handleRequest: async (request) => {
         seenRequests.push({
           method: request.method,
@@ -219,6 +256,19 @@ describe("sandbox callback bridge", () => {
       path: "/api/agents/me",
     });
 
+    const deleteResponse = await fetch(`${bridge.baseUrl}/api/attachments/attachment-1`, {
+      method: "DELETE",
+      headers: {
+        authorization: `Bearer ${bridgeToken}`,
+      },
+    });
+    expect(deleteResponse.status).toBe(200);
+    await expect(deleteResponse.json()).resolves.toMatchObject({
+      ok: true,
+      method: "DELETE",
+      path: "/api/attachments/attachment-1",
+    });
+
     const deniedResponse = await fetch(`${bridge.baseUrl}/api/issues/issue-1`, {
       method: "PATCH",
       headers: {
@@ -242,7 +292,7 @@ describe("sandbox callback bridge", () => {
       error: "Invalid bridge token.",
     });
 
-    expect(seenRequests).toHaveLength(1);
+    expect(seenRequests).toHaveLength(2);
     expect(seenRequests[0]).toMatchObject({
       method: "GET",
       path: "/api/agents/me",
@@ -255,7 +305,165 @@ describe("sandbox callback bridge", () => {
     });
     expect(seenRequests[0]?.headers.authorization).toBeUndefined();
     expect(seenRequests[0]?.headers["x-paperclip-run-id"]).toBeUndefined();
+    expect(seenRequests[1]).toMatchObject({
+      method: "DELETE",
+      path: "/api/attachments/attachment-1",
+      body: "",
+      headers: {},
+    });
+    expect(seenRequests[1]?.headers["content-type"]).toBeUndefined();
+  });
 
+  it("reconstructs a multi-MiB attachment through bounded JSON base64 responses", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-bridge-attachment-read-"));
+    cleanupDirs.push(rootDir);
+    const queueDir = path.join(rootDir, "queue");
+    const remoteWorkspaceDir = path.join(rootDir, "remote-workspace");
+    const assetRemoteDir = path.join(rootDir, "remote-assets");
+    await mkdir(remoteWorkspaceDir, { recursive: true });
+
+    const attachmentBody = Buffer.alloc(3 * 1024 * 1024 + 17);
+    for (let index = 0; index < attachmentBody.length; index += 1) {
+      attachmentBody[index] = index % 251;
+    }
+    const attachmentSha256 = sha256Hex(attachmentBody);
+    const bridgeToken = createSandboxCallbackBridgeToken();
+    const bridgeAsset = await createSandboxCallbackBridgeAsset();
+    cleanupFns.push(bridgeAsset.cleanup);
+    const worker = await startSandboxCallbackBridgeWorker({
+      client: createFileSystemSandboxCallbackBridgeQueueClient(),
+      queueDir,
+      handleRequest: async (request) => {
+        const params = new URLSearchParams(request.query);
+        const offset = Number(params.get("offset"));
+        const length = Number(params.get("length"));
+        const chunk = attachmentBody.subarray(offset, Math.min(offset + length, attachmentBody.length));
+        const nextOffset = offset + chunk.byteLength;
+        return {
+          status: 200,
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            attachmentId: "attachment-1",
+            encoding: "base64",
+            offset,
+            length: chunk.byteLength,
+            nextOffset,
+            eof: nextOffset >= attachmentBody.length,
+            byteSize: attachmentBody.length,
+            sha256: attachmentSha256,
+            data: chunk.toString("base64"),
+          }),
+        };
+      },
+    });
+    cleanupFns.push(async () => worker.stop());
+    const bridge = await startSandboxCallbackBridgeServer({
+      runner: createExecRunner(),
+      remoteCwd: remoteWorkspaceDir,
+      assetRemoteDir,
+      queueDir,
+      bridgeToken,
+      bridgeAsset,
+      timeoutMs: 30_000,
+    });
+    cleanupFns.push(async () => bridge.stop());
+
+    const chunks: Buffer[] = [];
+    let offset = 0;
+    while (offset < attachmentBody.length) {
+      const response = await fetch(
+        `${bridge.baseUrl}/api/attachments/attachment-1/content/chunk?offset=${offset}&length=${128 * 1024}&encoding=base64`,
+        { headers: { authorization: `Bearer ${bridgeToken}` } },
+      );
+      const text = await response.text();
+      expect(response.status).toBe(200);
+      expect(Buffer.byteLength(text, "utf8")).toBeLessThan(256 * 1024);
+      const payload = JSON.parse(text) as {
+        data: string;
+        length: number;
+        nextOffset: number;
+        sha256: string;
+      };
+      const chunk = Buffer.from(payload.data, "base64");
+      expect(chunk.byteLength).toBe(payload.length);
+      expect(payload.sha256).toBe(attachmentSha256);
+      chunks.push(chunk);
+      offset = payload.nextOffset;
+    }
+
+    const reconstructed = Buffer.concat(chunks);
+    expect(reconstructed.byteLength).toBe(attachmentBody.byteLength);
+    expect(sha256Hex(reconstructed)).toBe(attachmentSha256);
+  });
+
+  it("rejects invalid attachment chunks and enforces the cumulative run budget", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-bridge-attachment-budget-"));
+    cleanupDirs.push(rootDir);
+    const queueDir = path.join(rootDir, "queue");
+    const remoteWorkspaceDir = path.join(rootDir, "remote-workspace");
+    const assetRemoteDir = path.join(rootDir, "remote-assets");
+    await mkdir(remoteWorkspaceDir, { recursive: true });
+
+    const bridgeToken = createSandboxCallbackBridgeToken();
+    const bridgeAsset = await createSandboxCallbackBridgeAsset();
+    cleanupFns.push(bridgeAsset.cleanup);
+    let handled = 0;
+    const worker = await startSandboxCallbackBridgeWorker({
+      client: createFileSystemSandboxCallbackBridgeQueueClient(),
+      queueDir,
+      maxAttachmentReadBytes: 4,
+      handleRequest: async () => {
+        handled += 1;
+        return { status: 200, headers: { "content-type": "application/json" }, body: "{}" };
+      },
+    });
+    cleanupFns.push(async () => worker.stop());
+    const bridge = await startSandboxCallbackBridgeServer({
+      runner: createExecRunner(),
+      remoteCwd: remoteWorkspaceDir,
+      assetRemoteDir,
+      queueDir,
+      bridgeToken,
+      bridgeAsset,
+      timeoutMs: 30_000,
+    });
+    cleanupFns.push(async () => bridge.stop());
+
+    const headers = { authorization: `Bearer ${bridgeToken}` };
+    for (const query of [
+      "offset=-1&length=1&encoding=base64",
+      "offset=0&length=131073&encoding=base64",
+      "offset=0&length=1&encoding=utf8",
+      "offset=0&length=1&encoding=base64&download=1",
+    ]) {
+      const response = await fetch(
+        `${bridge.baseUrl}/api/attachments/attachment-1/content/chunk?${query}`,
+        { headers },
+      );
+      expect(response.status).toBe(400);
+    }
+    expect(handled).toBe(0);
+
+    const rawResponse = await fetch(`${bridge.baseUrl}/api/attachments/attachment-1/content`, { headers });
+    expect(rawResponse.status).toBe(403);
+    expect(handled).toBe(0);
+
+    const first = await fetch(
+      `${bridge.baseUrl}/api/attachments/attachment-1/content/chunk?offset=0&length=3&encoding=base64`,
+      { headers },
+    );
+    expect(first.status).toBe(200);
+    expect(handled).toBe(1);
+
+    const overBudget = await fetch(
+      `${bridge.baseUrl}/api/attachments/attachment-1/content/chunk?offset=3&length=2&encoding=base64`,
+      { headers },
+    );
+    expect(overBudget.status).toBe(429);
+    await expect(overBudget.json()).resolves.toEqual({
+      error: "Bridge attachment read budget exceeded the configured limit of 4 bytes for this run.",
+    });
+    expect(handled).toBe(1);
   });
 
   it("denies non-allowlisted requests by default", async () => {
@@ -641,6 +849,19 @@ describe("sandbox callback bridge", () => {
     await expect(nonJsonResponse.json()).resolves.toEqual({
       error: "Bridge only accepts JSON request bodies.",
     });
+
+    const unrelatedMultipartResponse = await fetch(`${bridge.baseUrl}/api/issues/issue-1/comments`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${bridgeToken}`,
+        "content-type": "multipart/form-data; boundary=not-an-attachment",
+      },
+      body: "--not-an-attachment--",
+    });
+    expect(unrelatedMultipartResponse.status).toBe(415);
+    await expect(unrelatedMultipartResponse.json()).resolves.toEqual({
+      error: "Bridge only accepts JSON request bodies.",
+    });
   });
 
   it("returns a 502 when the host response times out", async () => {
@@ -896,6 +1117,10 @@ describe("sandbox callback bridge", () => {
       { method: "POST", path: "/api/issues/issue-1/release" },
       { method: "PATCH", path: "/api/issues/issue-1" },
       { method: "GET", path: "/api/issues/issue-1/approvals" },
+      { method: "GET", path: "/api/issues/issue-1/attachments" },
+      { method: "POST", path: "/api/companies/co-1/issues/issue-1/attachments" },
+      { method: "GET", path: "/api/attachments/attachment-1/content/chunk" },
+      { method: "DELETE", path: "/api/attachments/attachment-1" },
       { method: "GET", path: "/api/issues/issue-1/work-products" },
       { method: "POST", path: "/api/issues/issue-1/work-products" },
       { method: "PATCH", path: "/api/work-products/wp-1" },
@@ -947,6 +1172,7 @@ describe("sandbox callback bridge", () => {
       { method: "POST", path: "/api/approvals/ap-1/approve" },
       { method: "POST", path: "/api/approvals/ap-1/reject" },
       { method: "POST", path: "/api/companies/co-1/logo" },
+      { method: "GET", path: "/api/attachments/attachment-1/content" },
       { method: "GET", path: "/api/companies/co-1/secrets" },
       { method: "PATCH", path: "/api/secrets/secret-1" },
     ];

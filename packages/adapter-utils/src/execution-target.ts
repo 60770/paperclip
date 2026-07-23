@@ -18,6 +18,8 @@ import {
   createCommandManagedSandboxCallbackBridgeQueueClient,
   createSandboxCallbackBridgeAsset,
   createSandboxCallbackBridgeToken,
+  decodeSandboxCallbackBridgeRequestBody,
+  DEFAULT_SANDBOX_CALLBACK_BRIDGE_MAX_ATTACHMENT_BODY_BYTES,
   DEFAULT_SANDBOX_CALLBACK_BRIDGE_MAX_BODY_BYTES,
   sandboxCallbackBridgeDirectories,
   startSandboxCallbackBridgeServer,
@@ -391,12 +393,29 @@ function preferredSandboxShell(target: AdapterSandboxExecutionTarget): "bash" | 
 
 type AdapterCommandCapableExecutionTarget = AdapterSshExecutionTarget | AdapterSandboxExecutionTarget;
 
-function adapterExecutionTargetCommandRunner(target: AdapterCommandCapableExecutionTarget): CommandManagedRuntimeRunner {
+function sandboxCallbackBridgeSshMaxBufferBytes(
+  maxBodyBytes: number,
+  maxAttachmentBodyBytes: number,
+): number {
+  // The multipart body is base64 in the queue JSON, then the SSH read command
+  // base64-encodes that file again before returning it to the host.
+  const requestBodyBytes = Math.max(maxBodyBytes, maxAttachmentBodyBytes);
+  const encodedRequestBodyBytes = 4 * Math.ceil(requestBodyBytes / 3);
+  const requestJsonBytes = encodedRequestBodyBytes + 64 * 1024;
+  const encodedRequestFileBytes = 4 * Math.ceil(requestJsonBytes / 3);
+  const base64LineBreakBytes = 2 * Math.ceil(encodedRequestFileBytes / 76) + 2;
+  return encodedRequestFileBytes + base64LineBreakBytes;
+}
+
+function adapterExecutionTargetCommandRunner(
+  target: AdapterCommandCapableExecutionTarget,
+  maxBufferBytes: number,
+): CommandManagedRuntimeRunner {
   if (target.transport === "ssh") {
     return createSshCommandManagedRuntimeRunner({
       spec: target.spec,
       defaultCwd: target.remoteCwd,
-      maxBufferBytes: DEFAULT_SANDBOX_CALLBACK_BRIDGE_MAX_BODY_BYTES * 4,
+      maxBufferBytes,
     });
   }
   return requireSandboxRunner(target);
@@ -1704,6 +1723,7 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
   hostApiUrl?: string | null;
   onLog?: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
   maxBodyBytes?: number | null;
+  maxAttachmentBodyBytes?: number | null;
 }): Promise<AdapterExecutionTargetPaperclipBridgeHandle | null> {
   if (!adapterExecutionTargetUsesPaperclipBridge(input.target)) {
     return null;
@@ -1731,13 +1751,22 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
     typeof input.maxBodyBytes === "number" && Number.isFinite(input.maxBodyBytes) && input.maxBodyBytes > 0
       ? Math.trunc(input.maxBodyBytes)
       : DEFAULT_SANDBOX_CALLBACK_BRIDGE_MAX_BODY_BYTES;
+  const maxAttachmentBodyBytes =
+    typeof input.maxAttachmentBodyBytes === "number" &&
+    Number.isFinite(input.maxAttachmentBodyBytes) &&
+    input.maxAttachmentBodyBytes > 0
+      ? Math.trunc(input.maxAttachmentBodyBytes)
+      : DEFAULT_SANDBOX_CALLBACK_BRIDGE_MAX_ATTACHMENT_BODY_BYTES;
   const hostApiUrl =
     input.hostApiUrl?.trim() ||
     process.env.PAPERCLIP_RUNTIME_API_URL?.trim() ||
     process.env.PAPERCLIP_API_URL?.trim() ||
     resolveDefaultPaperclipApiUrl();
   const shellCommand = adapterExecutionTargetShellCommand(target);
-  const runner = adapterExecutionTargetCommandRunner(target);
+  const runner = adapterExecutionTargetCommandRunner(
+    target,
+    sandboxCallbackBridgeSshMaxBufferBytes(maxBodyBytes, maxAttachmentBodyBytes),
+  );
   const bridgeTimeoutMs =
     typeof input.timeoutSec === "number" && Number.isFinite(input.timeoutSec) && input.timeoutSec > 0
       ? Math.trunc(input.timeoutSec * 1000)
@@ -1769,6 +1798,7 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
       client,
       queueDir,
       maxBodyBytes,
+      maxAttachmentBodyBytes,
       handleRequest: async (request) => {
         const method = request.method.trim().toUpperCase() || "GET";
         if (bridgeDebugEnabled) {
@@ -1784,10 +1814,18 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
         }
         headers.set("authorization", `Bearer ${hostApiToken}`);
         headers.set("x-paperclip-run-id", input.runId);
+        const requestBody = decodeSandboxCallbackBridgeRequestBody(request);
         const response = await fetch(buildBridgeForwardUrl(hostApiUrl, request), {
           method,
           headers,
-          ...(method === "GET" || method === "HEAD" ? {} : { body: request.body }),
+          ...(method === "GET" || method === "HEAD"
+            ? {}
+            : {
+                body:
+                  request.bodyEncoding === "base64"
+                    ? new Uint8Array(requestBody)
+                    : request.body,
+              }),
           signal: AbortSignal.timeout(30_000),
         });
         if (bridgeDebugEnabled) {
@@ -1812,6 +1850,7 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
       bridgeAsset,
       timeoutMs: bridgeTimeoutMs,
       maxBodyBytes,
+      maxAttachmentBodyBytes,
       shellCommand,
     });
   } catch (error) {

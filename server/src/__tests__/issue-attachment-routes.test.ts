@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { Readable } from "node:stream";
 import type { IncomingMessage } from "node:http";
 import express from "express";
@@ -7,9 +8,11 @@ import type { StorageService } from "../storage/types.js";
 
 const mockIssueService = vi.hoisted(() => ({
   getById: vi.fn(),
+  getByIdForCompany: vi.fn(),
   getByIdentifier: vi.fn(),
   createAttachment: vi.fn(),
   getAttachmentById: vi.fn(),
+  validateAttachmentComment: vi.fn(),
 }));
 const mockCompanyService = vi.hoisted(() => ({
   getById: vi.fn(),
@@ -253,6 +256,17 @@ describe("issue attachment routes", () => {
       assigneeUserId: null,
       identifier: "PAP-1",
     });
+    mockIssueService.getByIdForCompany.mockResolvedValue({
+      id: "11111111-1111-4111-8111-111111111111",
+      companyId: "company-1",
+      projectId: null,
+      parentId: null,
+      status: "todo",
+      assigneeAgentId: null,
+      assigneeUserId: null,
+      identifier: "PAP-1",
+    });
+    mockIssueService.validateAttachmentComment.mockResolvedValue(undefined);
     mockCompanyService.getById.mockResolvedValue({
       id: "company-1",
       attachmentMaxBytes: 1024 * 1024 * 1024,
@@ -392,6 +406,61 @@ describe("issue attachment routes", () => {
     expect(res.status).toBe(422);
     expect(res.body.error).toBe("Attachment exceeds 4 bytes");
     expect(mockIssueService.createAttachment).not.toHaveBeenCalled();
+  });
+
+  it("returns 404 for an issue outside the requested company without writing storage", async () => {
+    const storage = createStorageService();
+    mockIssueService.getByIdForCompany.mockResolvedValue(null);
+
+    const app = await createApp(storage);
+    const res = await request(app)
+      .post("/api/companies/company-1/issues/11111111-1111-4111-8111-111111111111/attachments")
+      .attach("file", Buffer.from("test"), { filename: "test.txt", contentType: "text/plain" });
+
+    expect(res.status).toBe(404);
+    expect(res.body.error).toBe("Issue not found");
+    expect(mockIssueService.getByIdForCompany).toHaveBeenCalledWith(
+      "company-1",
+      "11111111-1111-4111-8111-111111111111",
+    );
+    expect(storage.__calls.putFile).toBeUndefined();
+  });
+
+  it("validates the attachment comment before writing storage", async () => {
+    const storage = createStorageService();
+    const issueCommentId = "22222222-2222-4222-8222-222222222222";
+    const app = await createApp(storage);
+    const { notFound } = await import("../errors.js");
+    mockIssueService.validateAttachmentComment.mockRejectedValue(notFound("Issue comment not found"));
+    const res = await request(app)
+      .post("/api/companies/company-1/issues/11111111-1111-4111-8111-111111111111/attachments")
+      .field("issueCommentId", issueCommentId)
+      .attach("file", Buffer.from("test"), { filename: "test.txt", contentType: "text/plain" });
+
+    expect(res.status).toBe(404);
+    expect(res.body.error).toBe("Issue comment not found");
+    expect(mockIssueService.validateAttachmentComment).toHaveBeenCalledWith({
+      companyId: "company-1",
+      issueId: "11111111-1111-4111-8111-111111111111",
+      issueCommentId,
+    });
+    expect(storage.__calls.putFile).toBeUndefined();
+  });
+
+  it("deletes the stored object when attachment persistence fails", async () => {
+    const storage = createStorageService();
+    mockIssueService.createAttachment.mockRejectedValue(new Error("insert failed"));
+
+    const app = await createApp(storage);
+    const res = await request(app)
+      .post("/api/companies/company-1/issues/11111111-1111-4111-8111-111111111111/attachments")
+      .attach("file", Buffer.from("test"), { filename: "test.txt", contentType: "text/plain" });
+
+    expect(res.status).toBe(500);
+    expect(storage.deleteObject).toHaveBeenCalledWith(
+      "company-1",
+      "issues/11111111-1111-4111-8111-111111111111/test.txt",
+    );
   });
 
   it("serves html attachments as downloads with nosniff", async () => {
@@ -539,6 +608,129 @@ describe("issue attachment routes", () => {
 
     expect(res.status).toBe(403);
     expect(storage.getObject).not.toHaveBeenCalled();
+  });
+
+  it("reconstructs a multi-MiB attachment from bounded base64 chunks", async () => {
+    const attachmentBody = Buffer.alloc(3 * 1024 * 1024 + 17);
+    for (let index = 0; index < attachmentBody.length; index += 1) {
+      attachmentBody[index] = index % 251;
+    }
+    const sha256 = createHash("sha256").update(attachmentBody).digest("hex");
+    const storage = createStorageService(attachmentBody);
+    mockIssueService.getAttachmentById.mockResolvedValue({
+      ...makeAttachment("application/octet-stream", "bundle.part"),
+      byteSize: attachmentBody.length,
+      sha256,
+    });
+
+    const app = await createApp(storage);
+    const chunks: Buffer[] = [];
+    let offset = 0;
+    while (offset < attachmentBody.length) {
+      const res = await request(app).get(
+        `/api/attachments/attachment-1/content/chunk?offset=${offset}&length=${128 * 1024}&encoding=base64`,
+      );
+
+      expect(res.status).toBe(200);
+      expect(Buffer.byteLength(res.text, "utf8")).toBeLessThan(256 * 1024);
+      expect(res.body).toMatchObject({
+        attachmentId: "attachment-1",
+        encoding: "base64",
+        offset,
+        byteSize: attachmentBody.length,
+        sha256,
+      });
+      expect(res.body).not.toHaveProperty("objectKey");
+      expect(res.body).not.toHaveProperty("companyId");
+      const chunk = Buffer.from(res.body.data, "base64");
+      expect(chunk.byteLength).toBe(res.body.length);
+      chunks.push(chunk);
+      offset = res.body.nextOffset;
+    }
+
+    const reconstructed = Buffer.concat(chunks);
+    expect(reconstructed.byteLength).toBe(attachmentBody.byteLength);
+    expect(createHash("sha256").update(reconstructed).digest("hex")).toBe(sha256);
+  });
+
+  it.each([
+    "offset=-1&length=1&encoding=base64",
+    "offset=0&length=0&encoding=base64",
+    `offset=0&length=${128 * 1024 + 1}&encoding=base64`,
+    "offset=0&length=1&encoding=utf8",
+    "offset=0&length=1&encoding=base64&download=1",
+    "offset=0&offset=1&length=1&encoding=base64",
+  ])("rejects invalid attachment chunk query %s", async (query) => {
+    const storage = createStorageService();
+    const app = await createApp(storage);
+    const res = await request(app).get(`/api/attachments/attachment-1/content/chunk?${query}`);
+
+    expect(res.status).toBe(400);
+    expect(storage.getObject).not.toHaveBeenCalled();
+  });
+
+  it("rejects attachment chunk offsets outside the object", async () => {
+    const storage = createStorageService();
+    mockIssueService.getAttachmentById.mockResolvedValue(makeAttachment("application/octet-stream", "bundle.part"));
+
+    const app = await createApp(storage);
+    const res = await request(app).get(
+      "/api/attachments/attachment-1/content/chunk?offset=4&length=1&encoding=base64",
+    );
+
+    expect(res.status).toBe(416);
+    expect(storage.getObject).not.toHaveBeenCalled();
+  });
+
+  it("rejects cross-company attachment chunk reads", async () => {
+    const storage = createStorageService();
+    mockIssueService.getAttachmentById.mockResolvedValue(makeAttachment("application/octet-stream", "bundle.part"));
+
+    const app = await createApp(storage, { companyIds: ["company-2"], source: "session" });
+    const res = await request(app).get(
+      "/api/attachments/attachment-1/content/chunk?offset=0&length=4&encoding=base64",
+    );
+
+    expect(res.status).toBe(404);
+    expect(res.body.error).toBe("Attachment not found");
+    expect(storage.getObject).not.toHaveBeenCalled();
+  });
+
+  it("rejects same-company attachment chunk reads outside the parent issue boundary", async () => {
+    const storage = createStorageService();
+    mockIssueService.getAttachmentById.mockResolvedValue(makeAttachment("application/octet-stream", "bundle.part"));
+    mockAccessService.decide.mockResolvedValue({
+      allowed: false,
+      explanation: "Denied by test mock",
+    });
+
+    const app = await createApp(storage);
+    const res = await request(app).get(
+      "/api/attachments/attachment-1/content/chunk?offset=0&length=4&encoding=base64",
+    );
+
+    expect(res.status).toBe(403);
+    expect(storage.getObject).not.toHaveBeenCalled();
+  });
+
+  it("fails closed when storage exceeds the requested attachment chunk", async () => {
+    const storage = createStorageService();
+    mockIssueService.getAttachmentById.mockResolvedValue({
+      ...makeAttachment("application/octet-stream", "bundle.part"),
+      byteSize: 128 * 1024 + 1,
+    });
+    vi.mocked(storage.getObject).mockResolvedValue({
+      stream: Readable.from(Buffer.alloc(128 * 1024 + 1)),
+      contentLength: 128 * 1024 + 1,
+    });
+
+    const app = await createApp(storage);
+    const res = await request(app).get(
+      `/api/attachments/attachment-1/content/chunk?offset=0&length=${128 * 1024}&encoding=base64`,
+    );
+
+    expect(res.status).toBe(500);
+    expect(Buffer.byteLength(res.text, "utf8")).toBeLessThan(256 * 1024);
   });
 
   it("canonicalizes paperclip artifact metadata before creating a work product", async () => {

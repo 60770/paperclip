@@ -3859,6 +3859,28 @@ registry.registerPath({
 });
 
 registry.registerPath({
+  method: "get",
+  path: "/api/attachments/{attachmentId}/content/chunk",
+  tags: ["assets"],
+  summary: "Read a bounded attachment chunk as base64 JSON",
+  request: {
+    params: z.object({ attachmentId: z.string() }),
+    query: z.object({
+      offset: z.coerce.number().int().nonnegative(),
+      length: z.coerce.number().int().min(1).max(128 * 1024),
+      encoding: z.literal("base64"),
+    }),
+  },
+  responses: {
+    200: { description: "Bounded base64 attachment chunk" },
+    400: r.badRequest,
+    401: r.unauthorized,
+    404: r.notFound,
+    416: { description: "Offset outside attachment" },
+  },
+});
+
+registry.registerPath({
   method: "delete",
   path: "/api/attachments/{attachmentId}",
   tags: ["assets"],

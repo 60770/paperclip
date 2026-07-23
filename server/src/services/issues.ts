@@ -3751,22 +3751,26 @@ export function issueService(db: Db) {
     return title.trim().replace(/\s+/g, " ").toLowerCase();
   }
 
-  async function getIssueByUuid(id: string) {
+  async function getIssueByUuid(id: string, companyId?: string) {
     const row = await db
       .select()
       .from(issues)
-      .where(eq(issues.id, id))
+      .where(companyId ? and(eq(issues.id, id), eq(issues.companyId, companyId)) : eq(issues.id, id))
       .then((rows) => rows[0] ?? null);
     if (!row) return null;
     const [enriched] = await withIssueLabels(db, [row]);
     return enriched;
   }
 
-  async function getIssueByIdentifier(identifier: string) {
+  async function getIssueByIdentifier(identifier: string, companyId?: string) {
     const row = await db
       .select()
       .from(issues)
-      .where(eq(issues.identifier, identifier.toUpperCase()))
+      .where(
+        companyId
+          ? and(eq(issues.identifier, identifier.toUpperCase()), eq(issues.companyId, companyId))
+          : eq(issues.identifier, identifier.toUpperCase()),
+      )
       .then((rows) => rows[0] ?? null);
     if (!row) return null;
     const [enriched] = await withIssueLabels(db, [row]);
@@ -5153,6 +5157,18 @@ export function issueService(db: Db) {
         return null;
       }
       return getIssueByUuid(id);
+    },
+
+    getByIdForCompany: async (companyId: string, raw: string) => {
+      const id = raw.trim();
+      const identifier = normalizeIssueReferenceIdentifier(id);
+      if (identifier) {
+        return getIssueByIdentifier(identifier, companyId);
+      }
+      if (!isUuidLike(id)) {
+        return null;
+      }
+      return getIssueByUuid(id, companyId);
     },
 
     getByIdentifier: async (identifier: string) => {
@@ -7578,6 +7594,26 @@ export function issueService(db: Db) {
           updatedAt: attachment.updatedAt,
         };
       });
+    },
+
+    validateAttachmentComment: async (input: {
+      companyId: string;
+      issueId: string;
+      issueCommentId?: string | null;
+    }) => {
+      if (!input.issueCommentId) return;
+      const comment = await db
+        .select({ id: issueComments.id })
+        .from(issueComments)
+        .where(
+          and(
+            eq(issueComments.id, input.issueCommentId),
+            eq(issueComments.companyId, input.companyId),
+            eq(issueComments.issueId, input.issueId),
+          ),
+        )
+        .then((rows) => rows[0] ?? null);
+      if (!comment) throw notFound("Issue comment not found");
     },
 
     listAttachments: async (issueId: string) =>

@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import type { Readable } from "node:stream";
 import { Router, type Request, type Response } from "express";
 import multer from "multer";
 import { z } from "zod";
@@ -349,6 +350,38 @@ function noopTaskWatchdogService(): TaskWatchdogService {
 
 function buildAttachmentContentPath(attachmentId: string): string {
   return `/api/attachments/${attachmentId}/content`;
+}
+
+const ATTACHMENT_CHUNK_MAX_RAW_BYTES = 128 * 1024;
+const canonicalNonNegativeIntegerSchema = z
+  .string()
+  .regex(/^(?:0|[1-9][0-9]*)$/)
+  .transform(Number)
+  .refine(Number.isSafeInteger);
+const attachmentContentChunkQuerySchema = z
+  .object({
+    offset: canonicalNonNegativeIntegerSchema,
+    length: canonicalNonNegativeIntegerSchema.refine(
+      (value) => value > 0 && value <= ATTACHMENT_CHUNK_MAX_RAW_BYTES,
+    ),
+    encoding: z.literal("base64"),
+  })
+  .strict()
+  .refine((value) => Number.isSafeInteger(value.offset + value.length));
+
+async function readBoundedAttachmentChunk(stream: Readable, maxBytes: number): Promise<Buffer> {
+  const chunks: Buffer[] = [];
+  let totalBytes = 0;
+  for await (const value of stream) {
+    const chunk = Buffer.isBuffer(value) ? value : Buffer.from(value);
+    totalBytes += chunk.byteLength;
+    if (totalBytes > maxBytes) {
+      stream.destroy();
+      throw new Error("Attachment storage returned more bytes than the requested chunk.");
+    }
+    chunks.push(chunk);
+  }
+  return Buffer.concat(chunks, totalBytes);
 }
 
 const GENERIC_ATTACHMENT_CONTENT_TYPES = new Set([
@@ -10409,13 +10442,9 @@ export function issueRoutes(
     const companyId = req.params.companyId as string;
     const issueId = req.params.issueId as string;
     assertCompanyAccess(req, companyId);
-    const issue = await svc.getById(issueId);
+    const issue = await svc.getByIdForCompany(companyId, issueId);
     if (!issue) {
       res.status(404).json({ error: "Issue not found" });
-      return;
-    }
-    if (issue.companyId !== companyId) {
-      res.status(422).json({ error: "Issue does not belong to company" });
       return;
     }
     if (!(await assertAgentIssueMutationAllowed(req, res, issue))) return;
@@ -10455,6 +10484,12 @@ export function issueRoutes(
       return;
     }
 
+    await svc.validateAttachmentComment({
+      companyId,
+      issueId,
+      issueCommentId: parsedMeta.data.issueCommentId ?? null,
+    });
+
     const actor = getActorInfo(req);
     const stored = await storage.putFile({
       companyId,
@@ -10464,18 +10499,31 @@ export function issueRoutes(
       body: file.buffer,
     });
 
-    const attachment = await svc.createAttachment({
-      issueId,
-      issueCommentId: parsedMeta.data.issueCommentId ?? null,
-      provider: stored.provider,
-      objectKey: stored.objectKey,
-      contentType: stored.contentType,
-      byteSize: stored.byteSize,
-      sha256: stored.sha256,
-      originalFilename: stored.originalFilename,
-      createdByAgentId: actor.agentId,
-      createdByUserId: actor.actorType === "user" ? actor.actorId : null,
-    });
+    let attachment;
+    try {
+      attachment = await svc.createAttachment({
+        issueId,
+        issueCommentId: parsedMeta.data.issueCommentId ?? null,
+        provider: stored.provider,
+        objectKey: stored.objectKey,
+        contentType: stored.contentType,
+        byteSize: stored.byteSize,
+        sha256: stored.sha256,
+        originalFilename: stored.originalFilename,
+        createdByAgentId: actor.agentId,
+        createdByUserId: actor.actorType === "user" ? actor.actorId : null,
+      });
+    } catch (err) {
+      try {
+        await storage.deleteObject(companyId, stored.objectKey);
+      } catch (cleanupError) {
+        logger.warn(
+          { err: cleanupError, objectKey: stored.objectKey },
+          "storage cleanup failed after attachment persistence error",
+        );
+      }
+      throw err;
+    }
 
     await logActivity(db, {
       companyId,
@@ -10496,6 +10544,57 @@ export function issueRoutes(
     });
 
     res.status(201).json(withContentPath(attachment));
+  });
+
+  router.get("/attachments/:attachmentId/content/chunk", async (req, res) => {
+    const parsedQuery = attachmentContentChunkQuerySchema.safeParse(req.query);
+    if (!parsedQuery.success) {
+      res.status(400).json({
+        error: `Invalid attachment chunk query. Expected offset=<non-negative integer>, length=<1..${ATTACHMENT_CHUNK_MAX_RAW_BYTES}>, and encoding=base64.`,
+      });
+      return;
+    }
+
+    const attachmentId = req.params.attachmentId as string;
+    const attachment = await getAccessibleResource(req, res, svc.getAttachmentById(attachmentId), "Attachment not found");
+    if (!attachment) return;
+    const issue = await svc.getById(attachment.issueId);
+    if (!issue) {
+      res.status(404).json({ error: "Issue not found" });
+      return;
+    }
+    if (!(await assertIssueReadAllowed(req, res, issue))) return;
+
+    const { offset, length } = parsedQuery.data;
+    if (offset >= attachment.byteSize) {
+      res.status(416).json({ error: "Attachment chunk offset is outside the attachment." });
+      return;
+    }
+
+    const end = Math.min(offset + length - 1, attachment.byteSize - 1);
+    const expectedLength = end - offset + 1;
+    const object = await storage.getObject(attachment.companyId, attachment.objectKey, {
+      range: { start: offset, end },
+    });
+    const chunk = await readBoundedAttachmentChunk(object.stream, expectedLength);
+    if (chunk.byteLength !== expectedLength) {
+      throw new Error("Attachment storage returned fewer bytes than the requested chunk.");
+    }
+
+    const nextOffset = offset + chunk.byteLength;
+    res.setHeader("Cache-Control", "private, no-store");
+    res.setHeader("X-Content-Type-Options", "nosniff");
+    res.json({
+      attachmentId,
+      encoding: "base64",
+      offset,
+      length: chunk.byteLength,
+      nextOffset,
+      eof: nextOffset >= attachment.byteSize,
+      byteSize: attachment.byteSize,
+      sha256: attachment.sha256,
+      data: chunk.toString("base64"),
+    });
   });
 
   router.get("/attachments/:attachmentId/content", async (req, res, next) => {

@@ -13,12 +13,25 @@ const DEFAULT_BRIDGE_RESPONSE_TIMEOUT_MS = 30_000;
 const DEFAULT_BRIDGE_STOP_TIMEOUT_MS = 2_000;
 const DEFAULT_BRIDGE_MAX_QUEUE_DEPTH = 64;
 const DEFAULT_BRIDGE_MAX_BODY_BYTES = 256 * 1024;
+const DEFAULT_BRIDGE_MAX_ATTACHMENT_BODY_BYTES = 12 * 1024 * 1024;
+const DEFAULT_BRIDGE_ATTACHMENT_CHUNK_RAW_BYTES = 128 * 1024;
+const DEFAULT_BRIDGE_MAX_ATTACHMENT_READ_BYTES = 128 * 1024 * 1024;
 const REMOTE_WRITE_BASE64_CHUNK_SIZE = 32 * 1024;
+const DECODE_BASE64_VALIDATION_CHUNK_BYTES = 3 * 1024;
 const SANDBOX_CALLBACK_BRIDGE_ENTRYPOINT = "paperclip-bridge-server.mjs";
 const SANDBOX_EXEC_CHANNEL_ENV = "PAPERCLIP_SANDBOX_EXEC_CHANNEL";
 const SANDBOX_EXEC_CHANNEL_BRIDGE = "bridge";
 
 export const DEFAULT_SANDBOX_CALLBACK_BRIDGE_MAX_BODY_BYTES = DEFAULT_BRIDGE_MAX_BODY_BYTES;
+export const DEFAULT_SANDBOX_CALLBACK_BRIDGE_MAX_ATTACHMENT_BODY_BYTES =
+  DEFAULT_BRIDGE_MAX_ATTACHMENT_BODY_BYTES;
+export const DEFAULT_SANDBOX_CALLBACK_BRIDGE_ATTACHMENT_CHUNK_RAW_BYTES =
+  DEFAULT_BRIDGE_ATTACHMENT_CHUNK_RAW_BYTES;
+export const DEFAULT_SANDBOX_CALLBACK_BRIDGE_MAX_ATTACHMENT_READ_BYTES =
+  DEFAULT_BRIDGE_MAX_ATTACHMENT_READ_BYTES;
+
+const ISSUE_ATTACHMENT_UPLOAD_PATH = /^\/api\/companies\/[^/]+\/issues\/[^/]+\/attachments$/;
+const ATTACHMENT_CONTENT_CHUNK_PATH = /^\/api\/attachments\/[^/]+\/content\/chunk$/;
 
 export interface SandboxCallbackBridgeRouteRule {
   method: string;
@@ -66,6 +79,13 @@ export const DEFAULT_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST: readonly SandboxCa
   { method: "POST", path: /^\/api\/issues\/[^/]+\/release$/ },
   { method: "PATCH", path: /^\/api\/issues\/[^/]+$/ },
   { method: "GET", path: /^\/api\/issues\/[^/]+\/approvals$/ },
+
+  // Issue attachments: multipart upload is transported as base64 by the
+  // queue protocol so binary file contents remain byte-for-byte intact.
+  { method: "GET", path: /^\/api\/issues\/[^/]+\/attachments$/ },
+  { method: "POST", path: ISSUE_ATTACHMENT_UPLOAD_PATH },
+  { method: "GET", path: ATTACHMENT_CONTENT_CHUNK_PATH },
+  { method: "DELETE", path: /^\/api\/attachments\/[^/]+$/ },
 
   // Work products: publish branch/commit/artifact metadata for completed work.
   { method: "GET", path: /^\/api\/issues\/[^/]+\/work-products$/ },
@@ -115,11 +135,9 @@ export interface SandboxCallbackBridgeRequest {
   path: string;
   query: string;
   headers: Record<string, string>;
-  /**
-   * UTF-8 body contents. The bridge rejects non-JSON request bodies; binary
-   * payloads are intentionally out of scope for this queue protocol.
-   */
+  /** Body contents encoded according to `bodyEncoding`. */
   body: string;
+  bodyEncoding?: "utf8" | "base64";
   createdAt: string;
 }
 
@@ -186,6 +204,45 @@ function normalizeMethod(value: string | null | undefined): string {
 
 function normalizeTimeoutMs(value: number | null | undefined, fallback: number): number {
   return typeof value === "number" && Number.isFinite(value) && value > 0 ? Math.trunc(value) : fallback;
+}
+
+function parseCanonicalNonNegativeInteger(value: string | null): number | null {
+  if (value === null || !/^(?:0|[1-9][0-9]*)$/.test(value)) return null;
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) ? parsed : null;
+}
+
+function parseAttachmentChunkRequest(
+  request: Pick<SandboxCallbackBridgeRequest, "path" | "query" | "body">,
+): { kind: "none" } | { kind: "invalid" } | { kind: "chunk"; length: number } {
+  if (!ATTACHMENT_CONTENT_CHUNK_PATH.test(request.path)) return { kind: "none" };
+  if (request.body.length > 0) return { kind: "invalid" };
+
+  const query = request.query.trim();
+  const params = new URLSearchParams(query.startsWith("?") ? query.slice(1) : query);
+  const keys = [...params.keys()];
+  if (
+    keys.length !== 3 ||
+    new Set(keys).size !== 3 ||
+    !keys.every((key) => key === "offset" || key === "length" || key === "encoding")
+  ) {
+    return { kind: "invalid" };
+  }
+
+  const offset = parseCanonicalNonNegativeInteger(params.get("offset"));
+  const length = parseCanonicalNonNegativeInteger(params.get("length"));
+  if (
+    offset === null ||
+    length === null ||
+    length <= 0 ||
+    length > DEFAULT_BRIDGE_ATTACHMENT_CHUNK_RAW_BYTES ||
+    !Number.isSafeInteger(offset + length) ||
+    params.get("encoding") !== "base64"
+  ) {
+    return { kind: "invalid" };
+  }
+
+  return { kind: "chunk", length };
 }
 
 function toBuffer(bytes: Buffer | Uint8Array | ArrayBuffer): Buffer {
@@ -298,6 +355,51 @@ export function sanitizeSandboxCallbackBridgeHeaders(
   );
 }
 
+export function isSandboxCallbackBridgeAttachmentUploadRequest(
+  request: Pick<SandboxCallbackBridgeRequest, "method" | "path" | "headers">,
+): boolean {
+  const contentType = Object.entries(request.headers).find(
+    ([key]) => key.toLowerCase() === "content-type",
+  )?.[1] ?? "";
+  return (
+    normalizeMethod(request.method) === "POST" &&
+    ISSUE_ATTACHMENT_UPLOAD_PATH.test(request.path) &&
+    /^multipart\/form-data(?:;|$)/i.test(contentType.trim())
+  );
+}
+
+export function decodeSandboxCallbackBridgeRequestBody(
+  request: Pick<SandboxCallbackBridgeRequest, "body" | "bodyEncoding">,
+): Buffer {
+  const encoding = request.bodyEncoding ?? "utf8";
+  if (encoding === "utf8") return Buffer.from(request.body, "utf8");
+  if (encoding !== "base64") {
+    throw new Error(`Unsupported bridge request body encoding: ${String(encoding)}`);
+  }
+  if (request.body.length % 4 !== 0) {
+    throw new Error("Invalid base64 bridge request body.");
+  }
+  const decoded = Buffer.from(request.body, "base64");
+  if (!isBufferBase64Canonical(request.body, decoded)) {
+    throw new Error("Invalid base64 bridge request body.");
+  }
+  return decoded;
+}
+
+function isBufferBase64Canonical(body: string, decoded: Buffer): boolean {
+  if (body.length === 0) return decoded.length === 0;
+  if (decoded.length === 0) return body.length === 0;
+  let bodyOffset = 0;
+  for (let offset = 0; offset < decoded.length; offset += DECODE_BASE64_VALIDATION_CHUNK_BYTES) {
+    const chunkLength = Math.min(DECODE_BASE64_VALIDATION_CHUNK_BYTES, decoded.length - offset);
+    const encodedChunk = decoded.subarray(offset, offset + chunkLength).toString("base64");
+    const chunkBody = body.slice(bodyOffset, bodyOffset + encodedChunk.length);
+    if (chunkBody !== encodedChunk) return false;
+    bodyOffset += encodedChunk.length;
+  }
+  return bodyOffset === body.length;
+}
+
 export function sandboxCallbackBridgeDirectories(rootDir: string): SandboxCallbackBridgeDirectories {
   return {
     rootDir,
@@ -319,6 +421,7 @@ export function buildSandboxCallbackBridgeEnv(input: {
   responseTimeoutMs?: number | null;
   maxQueueDepth?: number | null;
   maxBodyBytes?: number | null;
+  maxAttachmentBodyBytes?: number | null;
 }): Record<string, string> {
   return {
     PAPERCLIP_API_BRIDGE_MODE: "queue_v1",
@@ -337,6 +440,9 @@ export function buildSandboxCallbackBridgeEnv(input: {
     ),
     PAPERCLIP_BRIDGE_MAX_BODY_BYTES: String(
       normalizeTimeoutMs(input.maxBodyBytes, DEFAULT_BRIDGE_MAX_BODY_BYTES),
+    ),
+    PAPERCLIP_BRIDGE_MAX_ATTACHMENT_BODY_BYTES: String(
+      normalizeTimeoutMs(input.maxAttachmentBodyBytes, DEFAULT_BRIDGE_MAX_ATTACHMENT_BODY_BYTES),
     ),
   };
 }
@@ -602,9 +708,19 @@ export async function startSandboxCallbackBridgeWorker(input: {
     body?: string;
   }>;
   maxBodyBytes?: number | null;
+  maxAttachmentBodyBytes?: number | null;
+  maxAttachmentReadBytes?: number | null;
 }): Promise<SandboxCallbackBridgeWorkerHandle> {
   const pollIntervalMs = normalizeTimeoutMs(input.pollIntervalMs, DEFAULT_BRIDGE_POLL_INTERVAL_MS);
   const maxBodyBytes = normalizeTimeoutMs(input.maxBodyBytes, DEFAULT_BRIDGE_MAX_BODY_BYTES);
+  const maxAttachmentBodyBytes = normalizeTimeoutMs(
+    input.maxAttachmentBodyBytes,
+    DEFAULT_BRIDGE_MAX_ATTACHMENT_BODY_BYTES,
+  );
+  const maxAttachmentReadBytes = normalizeTimeoutMs(
+    input.maxAttachmentReadBytes,
+    DEFAULT_BRIDGE_MAX_ATTACHMENT_READ_BYTES,
+  );
   const directories = sandboxCallbackBridgeDirectories(input.queueDir);
   await input.client.makeDir(directories.rootDir);
   await input.client.makeDir(directories.requestsDir);
@@ -615,6 +731,7 @@ export async function startSandboxCallbackBridgeWorker(input: {
   let inFlight = 0;
   let settled = false;
   let stopDeadline = Number.POSITIVE_INFINITY;
+  let attachmentReadBytes = 0;
   let settleResolve: (() => void) | null = null;
   const settledPromise = new Promise<void>((resolve) => {
     settleResolve = resolve;
@@ -655,6 +772,77 @@ export async function startSandboxCallbackBridgeWorker(input: {
       });
       await input.client.remove(requestPath);
       return;
+    }
+
+    let requestBodyBytes: Buffer;
+    try {
+      requestBodyBytes = decodeSandboxCallbackBridgeRequestBody(request);
+      const requestBodyLimit = isSandboxCallbackBridgeAttachmentUploadRequest(request)
+        ? maxAttachmentBodyBytes
+        : maxBodyBytes;
+      if (requestBodyBytes.byteLength > requestBodyLimit) {
+        await writeBridgeResponse(input.client, requestPath, responsePath, {
+          id: request.id,
+          status: 413,
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            error: `Bridge request body exceeded the configured size limit of ${requestBodyLimit} bytes.`,
+          }),
+          completedAt: new Date().toISOString(),
+        });
+        await input.client.remove(requestPath);
+        return;
+      }
+      if (
+        request.bodyEncoding === "base64" &&
+        !isSandboxCallbackBridgeAttachmentUploadRequest(request)
+      ) {
+        throw new Error("Base64 bridge request bodies are only allowed for multipart issue attachment uploads.");
+      }
+    } catch (error) {
+      await writeBridgeResponse(input.client, requestPath, responsePath, {
+        id: request.id,
+        status: 400,
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ error: error instanceof Error ? error.message : String(error) }),
+        completedAt: new Date().toISOString(),
+      });
+      await input.client.remove(requestPath);
+      return;
+    }
+
+    const attachmentChunkRequest = parseAttachmentChunkRequest(request);
+    if (attachmentChunkRequest.kind === "invalid") {
+      await writeBridgeResponse(input.client, requestPath, responsePath, {
+        id: request.id,
+        status: 400,
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          error: `Invalid attachment chunk request. Expected offset=<non-negative integer>, length=<1..${DEFAULT_BRIDGE_ATTACHMENT_CHUNK_RAW_BYTES}>, and encoding=base64.`,
+        }),
+        completedAt: new Date().toISOString(),
+      });
+      await input.client.remove(requestPath);
+      return;
+    }
+    if (
+      attachmentChunkRequest.kind === "chunk" &&
+      attachmentReadBytes + attachmentChunkRequest.length > maxAttachmentReadBytes
+    ) {
+      await writeBridgeResponse(input.client, requestPath, responsePath, {
+        id: request.id,
+        status: 429,
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          error: `Bridge attachment read budget exceeded the configured limit of ${maxAttachmentReadBytes} bytes for this run.`,
+        }),
+        completedAt: new Date().toISOString(),
+      });
+      await input.client.remove(requestPath);
+      return;
+    }
+    if (attachmentChunkRequest.kind === "chunk") {
+      attachmentReadBytes += attachmentChunkRequest.length;
     }
 
     try {
@@ -886,6 +1074,7 @@ export async function startSandboxCallbackBridgeServer(input: {
   shellCommand?: "bash" | "sh" | null;
   maxQueueDepth?: number | null;
   maxBodyBytes?: number | null;
+  maxAttachmentBodyBytes?: number | null;
 }): Promise<StartedSandboxCallbackBridgeServer> {
   const timeoutMs = normalizeTimeoutMs(input.timeoutMs, DEFAULT_BRIDGE_RESPONSE_TIMEOUT_MS);
   const shellCommand = preferredShellForSandbox(input.shellCommand);
@@ -911,6 +1100,7 @@ export async function startSandboxCallbackBridgeServer(input: {
     responseTimeoutMs: input.responseTimeoutMs,
     maxQueueDepth: input.maxQueueDepth,
     maxBodyBytes: input.maxBodyBytes,
+    maxAttachmentBodyBytes: input.maxAttachmentBodyBytes,
   });
   const nodeCommand = input.nodeCommand?.trim() || "node";
   const startResult = await input.runner.execute({
@@ -1032,6 +1222,8 @@ const pollIntervalMs = Number(process.env.PAPERCLIP_BRIDGE_POLL_INTERVAL_MS || "
 const responseTimeoutMs = Number(process.env.PAPERCLIP_BRIDGE_RESPONSE_TIMEOUT_MS || "30000");
 const maxQueueDepth = Number(process.env.PAPERCLIP_BRIDGE_MAX_QUEUE_DEPTH || "${DEFAULT_BRIDGE_MAX_QUEUE_DEPTH}");
 const maxBodyBytes = Number(process.env.PAPERCLIP_BRIDGE_MAX_BODY_BYTES || "${DEFAULT_BRIDGE_MAX_BODY_BYTES}");
+const maxAttachmentBodyBytes = Number(process.env.PAPERCLIP_BRIDGE_MAX_ATTACHMENT_BODY_BYTES || "${DEFAULT_BRIDGE_MAX_ATTACHMENT_BODY_BYTES}");
+const issueAttachmentUploadPath = ${ISSUE_ATTACHMENT_UPLOAD_PATH.toString()};
 const allowedHeaders = new Set(${JSON.stringify([...DEFAULT_SANDBOX_CALLBACK_BRIDGE_HEADER_ALLOWLIST])});
 
 if (!queueDir || !bridgeToken) {
@@ -1060,18 +1252,18 @@ function normalizeHeaders(headers) {
   return out;
 }
 
-async function readBody(req) {
+async function readBody(req, maxBytes) {
   const chunks = [];
   let totalBytes = 0;
   for await (const chunk of req) {
     const nextChunk = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
     chunks.push(nextChunk);
     totalBytes += nextChunk.byteLength;
-    if (totalBytes > maxBodyBytes) {
+    if (totalBytes > maxBytes) {
       throw new Error("Bridge request body exceeded the configured size limit.");
     }
   }
-  return Buffer.concat(chunks).toString("utf8");
+  return Buffer.concat(chunks, totalBytes);
 }
 
 async function queueDepth() {
@@ -1120,21 +1312,24 @@ const server = createServer(async (req, res) => {
 
     const url = new URL(req.url || "/", "http://127.0.0.1");
     const contentType = typeof req.headers["content-type"] === "string" ? req.headers["content-type"] : "";
-    if (req.method && req.method !== "GET" && req.method !== "HEAD" && !/json/i.test(contentType)) {
+    const method = req.method || "GET";
+    const isAttachmentUpload = method === "POST" && issueAttachmentUploadPath.test(url.pathname) && /^multipart\\/form-data(?:;|$)/i.test(contentType.trim());
+    const requestBody = await readBody(req, isAttachmentUpload ? maxAttachmentBodyBytes : maxBodyBytes);
+    if (method !== "GET" && method !== "HEAD" && requestBody.byteLength > 0 && !isAttachmentUpload && !/json/i.test(contentType)) {
       res.statusCode = 415;
       res.setHeader("content-type", "application/json");
       res.end(JSON.stringify({ error: "Bridge only accepts JSON request bodies." }));
       return;
     }
     const requestId = randomUUID();
-    const requestBody = await readBody(req);
     const payload = {
       id: requestId,
-      method: req.method || "GET",
+      method,
       path: url.pathname,
       query: url.search,
       headers: normalizeHeaders(req.headers),
-      body: requestBody,
+      body: isAttachmentUpload ? requestBody.toString("base64") : requestBody.toString("utf8"),
+      bodyEncoding: isAttachmentUpload ? "base64" : "utf8",
       createdAt: new Date().toISOString(),
     };
     const requestPath = path.posix.join(requestsDir, \`\${requestId}.json\`);
