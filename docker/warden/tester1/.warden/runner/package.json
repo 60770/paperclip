@@ -1,0 +1,10 @@
+{
+  "name": "paperclip-tester1-warden-runner",
+  "version": "1.0.0",
+  "description": "Locked runtime dependencies for the Tester1 Warden runner",
+  "private": true,
+  "dependencies": {
+    "@openai/codex": "0.144.1",
+    "@playwright/mcp": "0.0.78"
+  }
+}

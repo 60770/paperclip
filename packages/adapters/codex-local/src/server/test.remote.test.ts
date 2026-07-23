@@ -219,6 +219,47 @@ describe("codex remote environment diagnostics", () => {
     expect(probeCall?.[3]).toContain("--skip-git-repo-check");
   });
 
+  it("runs the hello probe through the canonical Warden wrapper", async () => {
+    const remoteTarget: AdapterExecutionTarget = {
+      kind: "remote",
+      transport: "ssh",
+      remoteCwd: "/workspace",
+      spec: {
+        host: "127.0.0.1",
+        port: 2223,
+        username: "runner",
+        privateKey: "PRIVATE KEY",
+        knownHosts: "KNOWN HOSTS",
+        remoteCwd: "/workspace",
+        remoteWorkspacePath: "/workspace",
+        strictHostKeyChecking: true,
+      },
+    };
+
+    const result = await testEnvironment({
+      companyId: "company-1",
+      adapterType: "codex_local",
+      config: {
+        engine: "cli",
+        command: "/usr/local/bin/codex-warden",
+        search: true,
+      },
+      executionTarget: remoteTarget,
+      environmentName: "Tester1 Warden",
+    });
+
+    expect(result.status).toBe("pass");
+    expect(result.checks.some((check) => check.code === "codex_hello_probe_passed")).toBe(true);
+    expect(
+      result.checks.some((check) => check.code === "codex_hello_probe_skipped_custom_command"),
+    ).toBe(false);
+    const probeCall = runAdapterExecutionTargetProcess.mock.calls[0] as unknown as
+      | [string, AdapterExecutionTarget, string, string[], { cwd: string; env: Record<string, string> }]
+      | undefined;
+    expect(probeCall?.[2]).toBe("/usr/local/bin/codex-warden");
+    expect(probeCall?.[3].slice(0, 2)).toEqual(["--search", "exec"]);
+  });
+
   it("does not override CODEX_HOME when the host has no credentials to seed", async () => {
     // Custom-image flow: the login lives inside the captured snapshot, and the
     // host has no Codex auth.json. The probe must not upload an empty home or

@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+expect_config_value=false
+for arg in "$@"; do
+  if [[ "${expect_config_value}" == "true" ]]; then
+    if [[ "${arg}" == sandbox_mode=* ]]; then
+      printf 'codex-warden: external sandbox_mode overrides are not allowed\n' >&2
+      exit 64
+    fi
+    expect_config_value=false
+    continue
+  fi
+
+  case "${arg}" in
+    --dangerously-bypass-approvals-and-sandbox|--yolo)
+      printf 'codex-warden: approval and sandbox bypass is not allowed\n' >&2
+      exit 64
+      ;;
+    --sandbox|--sandbox=*|--config=sandbox_mode=*|-c=sandbox_mode=*)
+      printf 'codex-warden: external sandbox overrides are not allowed\n' >&2
+      exit 64
+      ;;
+    -c|--config)
+      expect_config_value=true
+      ;;
+  esac
+done
+
+codex_args=("$@")
+global_args=()
+if [[ "${codex_args[0]:-}" == "--search" ]]; then
+  global_args+=("--search")
+  codex_args=("${codex_args[@]:1}")
+fi
+if [[ "${codex_args[0]:-}" != "exec" ]]; then
+  printf 'codex-warden: only the Paperclip exec invocation is allowed\n' >&2
+  exit 64
+fi
+
+exec /usr/local/bin/codex "${global_args[@]}" exec --sandbox danger-full-access "${codex_args[@]:1}"

@@ -51,6 +51,10 @@ function commandLooksLike(command: string, expected: string): boolean {
   return base === expected || base === `${expected}.cmd` || base === `${expected}.exe`;
 }
 
+function commandSupportsHelloProbe(command: string): boolean {
+  return commandLooksLike(command, "codex") || command === "/usr/local/bin/codex-warden";
+}
+
 function summarizeProbeDetail(stdout: string, stderr: string, parsedError: string | null): string | null {
   const raw = parsedError?.trim() || firstNonEmptyLine(stderr) || firstNonEmptyLine(stdout);
   if (!raw) return null;
@@ -318,7 +322,7 @@ export async function testEnvironment(
   const canRunProbe =
     checks.every((check) => check.code !== "codex_cwd_invalid" && check.code !== "codex_command_unresolvable");
   if (canRunProbe) {
-    if (!commandLooksLike(command, "codex")) {
+    if (!commandSupportsHelloProbe(command)) {
       checks.push({
         code: "codex_hello_probe_skipped_custom_command",
         level: "info",
